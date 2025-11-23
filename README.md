@@ -16,10 +16,15 @@ A robust computer vision system for detecting and monitoring periodic LED flashe
 - **Noise Floor Tracking**: Maintains rolling window of background measurements, updates threshold continuously
 - **Debug Image Generation**: Automatically saves `debug_detection.png` showing detected ROI and peak location
 
-### **Hardware Support**
+### **Hardware Support & Optimization**
 - **Raspberry Pi 5**: Native `picamera2` support with manual exposure control
 - **USB Webcams**: OpenCV-based driver for any standard webcam (Windows/Linux)
 - **Cross-Platform**: Tested on Raspberry Pi OS, Ubuntu 24.04, Windows 10/11
+- **Rolling Shutter Exploitation**: Detects LED pulses as brief as 1ms by leveraging sequential row exposure
+  - CMOS sensors expose rows sequentially over ~10ms (rolling shutter effect)
+  - Exposure time (8.3ms) set to half the frame period (16.666ms) for optimal brief pulse capture
+  - Brief LED flashes "between frames" are still captured by some sensor rows
+  - Critical advantage over global shutter cameras for sub-frame pulse detection
 
 ### **Advanced Features (Configurable)**
 - **Saturation Logging**: Real-time tracking of sensor saturation (warns when >10% of frames clipped)
@@ -119,9 +124,15 @@ python3 src/led_detection/main.py --interval 60 --adaptive-exposure --debug
 The system operates in distinct phases to ensure reliable detection:
 
 ### Phase 1: Camera Initialization
-- Sets camera to **manual exposure mode** (8.3ms / 1/120s)
-  - Rejects 60Hz AC flicker (half-cycle = 8.33ms)
-  - Prevents auto-exposure "breathing" that causes false positives
+- Sets camera to **manual exposure mode** (8.3ms / 1/120s) at **60fps** (16.666ms frame period)
+  - **Exploits Rolling Shutter**: Exposure time is HALF the frame period
+    - Most cameras use CMOS sensors with rolling shutter (rows exposed sequentially)
+    - A 1ms LED pulse occurring anywhere in the 16.666ms frame period will be captured by SOME rows
+    - Different rows "see" different time windows as shutter rolls top-to-bottom (~10ms scan time)
+    - **Example**: LED flashes for 1ms at t=7ms → Rows 100-150 capture it even though it's "between frames"
+    - Global shutter cameras at 60fps might miss brief pulses entirely
+  - **Rejects 60Hz AC Flicker**: 8.33ms = half-cycle of 60Hz mains (anti-flicker)
+  - **Prevents Auto-Exposure Breathing**: Fixed exposure stops gain hunting that causes false positives
 - Locks gain, focus, and white balance
 - Optional: 5-second aiming phase with preview window (`--preview`)
 
@@ -412,7 +423,10 @@ python3 src/led_detection/main.py --interval 60 --adaptive-exposure
 ### Timing
 - **Frame Rate**: 30-60 fps (camera dependent)
 - **Detection Latency**: <100ms (limited by frame rate)
-- **Minimum Pulse Width**: ~16ms (1 frame at 60fps)
+- **Minimum Pulse Width**: ~1ms (thanks to rolling shutter!)
+  - Rolling shutter scans sensor over ~10ms
+  - Brief pulses captured by some rows even if "between frames"
+  - Global shutter would require 16ms minimum (1 full frame at 60fps)
 - **Threshold Update Rate**: Every frame when LED is OFF
 
 ### Robustness
@@ -467,6 +481,10 @@ led_detection/
 This project was developed through collaborative iteration with Claude and Gemini AI assistants. Contributions are welcome!
 
 ### Known Limitations
+- **Global Shutter Cameras**: System is optimized for rolling shutter (CMOS sensors)
+  - Global shutter cameras (e.g., some industrial cameras) won't capture sub-frame pulses (<16ms)
+  - Brief LED flashes may be missed entirely if they occur between frame captures
+  - Rolling shutter cameras (standard in RPi/USB webcams) provide superior brief pulse detection
 - Adaptive exposure may oscillate with some webcams (experimental)
 - Minimum LED size: ~5 pixels (for blob detection)
 - Maximum framerate: Limited by camera hardware
