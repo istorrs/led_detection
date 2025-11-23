@@ -121,7 +121,13 @@ def get_driver():
 
 class PeakMonitor:  # pylint: disable=too-many-instance-attributes
     """Monitor for LED detection."""
-    def __init__(self, interval, threshold, preview=False):
+    def __init__(self, interval, threshold, preview=False,
+                 use_contrast=True,      # 1a: Contrast-based detection
+                 adaptive_roi=True,      # 1b: Adaptive ROI sizing
+                 adaptive_off=True,      # 1c: Adaptive OFF detection
+                 log_saturation=True,    # 2a: Saturation logging
+                 adaptive_exposure=False # 2b: Adaptive exposure (experimental)
+                ):
         self.cam = get_driver()
         self.interval = interval
         self.preview = preview
@@ -130,6 +136,26 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.min_signal_strength = threshold
         self.detected_peak_strength = 0.0
         self.detected_on_brightness = 0.0  # Actual brightness when ON
+
+        # Feature flags
+        self.use_contrast = use_contrast
+        self.adaptive_roi = adaptive_roi
+        self.adaptive_off = adaptive_off
+        self.log_saturation = log_saturation
+        self.adaptive_exposure = adaptive_exposure
+
+        # Saturation tracking
+        self.saturation_count = 0
+        self.total_frames = 0
+
+    def _measure_roi(self, roi):
+        """Measure ROI using either contrast or brightness based on feature flag."""
+        if self.use_contrast:
+            # Contrast-based: max - median (robust against global illumination)
+            return float(roi.max()) - float(np.median(roi))
+        else:
+            # Brightness-based: 90th percentile (original behavior)
+            return float(np.percentile(roi, 90))
 
     def aim_camera(self):
         """Aiming phase helper."""
@@ -169,11 +195,11 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 if max_val > self.min_signal_strength:
                     self.detected_peak_strength = max_val
                     logging.info("SIGNAL DETECTED! Score: %.0f", max_val)
-                    self.lock_roi(max_loc, frame.shape)
+                    self.lock_roi(max_loc, frame.shape, accum_max_diff)
                     # Store actual brightness (not change score) for threshold calculation
-                    self.detected_on_brightness = np.percentile(
-                        frame[self.roi[0]:self.roi[1], self.roi[2]:self.roi[3]], 90)
-                    logging.info("[Debug] Initial ROI brightness (P90): %.1f",
+                    roi_slice = frame[self.roi[0]:self.roi[1], self.roi[2]:self.roi[3]]
+                    self.detected_on_brightness = self._measure_roi(roi_slice)
+                    logging.info("[Debug] Initial ROI brightness: %.1f",
                                 self.detected_on_brightness)
                     return True
 
@@ -192,50 +218,150 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         print("")
         return False
 
-    def lock_roi(self, loc, shape):
+    def lock_roi(self, loc, shape, accum_max_diff=None):
         """Lock Region of Interest."""
         c_x, c_y = loc
         h, w = shape
-        size = 32
+
+        if self.adaptive_roi and accum_max_diff is not None:
+            # Adaptive ROI: measure blob size
+            threshold_val = self.min_signal_strength * 0.5
+            _, binary = cv2.threshold(accum_max_diff, threshold_val, 255, cv2.THRESH_BINARY)
+            binary = binary.astype(np.uint8)
+
+            # Find connected components
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+
+            # Find the component containing the peak location
+            peak_label = labels[c_y, c_x]
+
+            if peak_label > 0:  # 0 is background
+                bbox = stats[peak_label]  # x, y, width, height, area
+                blob_w, blob_h = bbox[2], bbox[3]
+
+                # Use blob size with 1.5x margin, constrained to min/max
+                size = int(max(blob_w, blob_h) * 0.75)  # 1.5x margin (size is half-width)
+                size = max(16, min(64, size))  # Constrain between 32x32 and 128x128
+                logging.info("Adaptive ROI: Blob size %dx%d -> ROI half-size %d",
+                            blob_w, blob_h, size)
+            else:
+                size = 32  # Fallback
+                logging.warning("Peak not in any blob, using default ROI size")
+        else:
+            # Fixed ROI (original behavior)
+            size = 32
+
         x1, x2 = max(0, c_x - size), min(w, c_x + size)
         y1, y2 = max(0, c_y - size), min(h, c_y + size)
         self.roi = (y1, y2, x1, x2)
-        logging.info("ROI Locked: %s", self.roi)
+        logging.info("ROI Locked: %s (size: %dx%d)", self.roi, x2-x1, y2-y1)
         if isinstance(self.cam, X86CameraDriver):
             cv2.destroyWindow("Calibration")
+
+    def calibrate_exposure(self):
+        """Adaptively calibrate camera exposure to avoid saturation."""
+        if not self.adaptive_exposure:
+            return
+
+        if not isinstance(self.cam, X86CameraDriver):
+            logging.info("Adaptive exposure only supported for X86CameraDriver")
+            return
+
+        logging.info("Starting adaptive exposure calibration...")
+        y1, y2, x1, x2 = self.roi
+        target_bg = 80      # Target background brightness
+        target_led = 200    # Target LED brightness (not saturated)
+
+        for iteration in range(10):
+            # Capture frame and measure
+            f = self.cam.get_frame()
+            roi = f[y1:y2, x1:x2]
+            bg_brightness = np.median(roi)
+            max_brightness = np.percentile(roi, 95)
+
+            logging.info("Iteration %d: BG=%.1f, Peak=%.1f", iteration, bg_brightness, max_brightness)
+
+            # Check if we're in good range
+            if bg_brightness < 150 and max_brightness < 250:
+                logging.info("Exposure calibration complete: BG=%.1f, Peak=%.1f",
+                            bg_brightness, max_brightness)
+                return
+
+            # Get current exposure
+            current_exposure = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
+
+            # Adjust exposure based on brightness
+            if bg_brightness > 150 or max_brightness > 250:
+                # Too bright, reduce exposure
+                new_exposure = current_exposure * 0.7
+                logging.info("Too bright, reducing exposure: %.1f -> %.1f",
+                            current_exposure, new_exposure)
+            elif max_brightness < 150:
+                # Too dim, increase exposure
+                new_exposure = current_exposure * 1.3
+                logging.info("Too dim, increasing exposure: %.1f -> %.1f",
+                            current_exposure, new_exposure)
+            else:
+                # Good enough
+                break
+
+            # Apply new exposure
+            self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+            time.sleep(0.5)  # Allow sensor to settle
+
+        logging.info("Adaptive exposure complete after %d iterations", iteration + 1)
 
     def wait_for_led_off(self):
         """ Monitors ROI brightness until it drops significanty """
         logging.info("Waiting for LED to turn OFF...")
         y1, y2, x1, x2 = self.roi
 
-        # Measure "High" State using percentile to ignore saturated center
+        # Measure "High" State
         f = self.cam.get_frame()
-        high_val = np.percentile(f[y1:y2, x1:x2], 90)
+        roi = f[y1:y2, x1:x2]
+        high_val = self._measure_roi(roi)
 
-        # If we are already saturated or very bright, we assume ON.
-        # But if detection was weak, high_val might be low.
-        # We enforce a hard drop or a timeout.
+        if self.adaptive_off:
+            # Adaptive: measure initial variance to set noise-based threshold
+            samples = []
+            for _ in range(10):
+                f = self.cam.get_frame()
+                roi = f[y1:y2, x1:x2]
+                samples.append(self._measure_roi(roi))
+                time.sleep(0.05)
+
+            initial_mean = np.mean(samples)
+            noise_std = np.std(samples)
+
+            # Threshold: mean - 3*sigma (drop below noise floor)
+            drop_threshold = max(initial_mean - (3 * noise_std), 10)  # Min 10 to avoid negatives
+            logging.info("Adaptive OFF: Initial=%.1f, Std=%.1f, Threshold=%.1f",
+                        initial_mean, noise_std, drop_threshold)
+        else:
+            # Fixed threshold (original behavior)
+            drop_threshold = high_val * 0.6
 
         start = time.time()
         while time.time() - start < 15.0: # 15s Timeout
             f = self.cam.get_frame()
-            curr_val = np.percentile(f[y1:y2, x1:x2], 90)
+            roi = f[y1:y2, x1:x2]
+            curr_val = self._measure_roi(roi)
 
-            # Condition 1: Significant drop relative to high
-            drop_cond = curr_val < (high_val * 0.6)
+            # Condition 1: Drop below threshold
+            drop_cond = curr_val < drop_threshold
 
             # Condition 2: Absolute dark (safe noise floor)
-            # If we are below 100 (out of 255), it's likely OFF enough for calibration
-            abs_cond = curr_val < 100
+            # For contrast mode, this is different than brightness mode
+            abs_threshold = 50 if self.use_contrast else 100
+            abs_cond = curr_val < abs_threshold
 
             if drop_cond or abs_cond:
-                logging.info("LED OFF Confirmed (High: %s -> Low: %s)", high_val, curr_val)
+                logging.info("LED OFF Confirmed (High: %.1f -> Low: %.1f)", high_val, curr_val)
                 time.sleep(0.5) # Allow settling
                 return True
 
             sys.stdout.write(f"\r    Waiting for drop... Curr: {curr_val:.0f} "
-                             f"(High: {high_val:.0f})   ")
+                             f"(Threshold: {drop_threshold:.0f})   ")
             sys.stdout.flush()
             time.sleep(0.1)
 
@@ -259,36 +385,44 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # 2. Wait for "OFF" State
         self.wait_for_led_off()
 
+        # 2b. Adaptive Exposure (if enabled)
+        self.calibrate_exposure()
+
         # 3. Calibrate Noise Floor (OFF State)
         logging.info("Calibrating OFF-state noise floor...")
         y1, y2, x1, x2 = self.roi
-        brightness_samples = []
+        metric_samples = []
+        bg_brightness_samples = []  # Track background for saturation
+
         for _ in range(30):
             f = self.cam.get_frame()
-            # Use 90th percentile instead of max to handle saturation
-            brightness_samples.append(np.percentile(f[y1:y2, x1:x2], 90))
+            roi = f[y1:y2, x1:x2]
+            metric_samples.append(self._measure_roi(roi))
+            bg_brightness_samples.append(np.median(roi))  # Background brightness
 
-        avg_noise_brightness = np.mean(brightness_samples)
+        avg_noise_level = np.mean(metric_samples)
+        avg_bg_brightness = np.mean(bg_brightness_samples)
 
-        # DYNAMIC THRESHOLD using actual measured ON brightness
-        # Use the actual ON brightness we measured, not the change score
+        # DYNAMIC THRESHOLD using actual measured ON level
         if self.detected_on_brightness > 10:
             estimated_on_level = self.detected_on_brightness
         else:
             # Fallback if we didn't measure it properly
-            estimated_on_level = avg_noise_brightness + self.detected_peak_strength
+            estimated_on_level = avg_noise_level + self.detected_peak_strength
 
         # Set threshold halfway between OFF and ON
-        self.thresh_bright = (avg_noise_brightness + estimated_on_level) / 2.0
+        self.thresh_bright = (avg_noise_level + estimated_on_level) / 2.0
 
-        logging.info("Noise (P90): %.1f | Est. ON: %.1f", avg_noise_brightness, estimated_on_level)
-        logging.info("Set Brightness Threshold: %.1f", self.thresh_bright)
+        metric_name = "Contrast" if self.use_contrast else "Brightness"
+        logging.info("Noise (%s): %.1f | Est. ON: %.1f", metric_name, avg_noise_level, estimated_on_level)
+        logging.info("Set Detection Threshold: %.1f", self.thresh_bright)
 
-        if avg_noise_brightness > 240:
-            logging.warning("[SATURATION] Noise floor is %.1f (too bright!)",
-                            avg_noise_brightness)
-            logging.warning("Consider: 1) ND filter, 2) Reduce LED, "
-                            "3) Increase distance")
+        # Saturation check
+        if self.log_saturation and avg_bg_brightness > 240:
+            logging.warning("[SATURATION] Background is %.1f (near clipping!)",
+                            avg_bg_brightness)
+            logging.warning("Consider: 1) ND filter, 2) Reduce LED brightness, "
+                            "3) Increase distance, 4) Enable --adaptive-exposure")
 
         # 4. Monitor
         logging.info("--- MONITORING STARTED ---")
@@ -305,19 +439,25 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         while True:
             frame = self.cam.get_frame()
             roi = frame[y1:y2, x1:x2]
-            # Use 90th percentile instead of max to handle partial saturation
-            val_bright = np.percentile(roi, 90)
+            val = self._measure_roi(roi)
             now = time.time()
 
+            # Saturation tracking
+            if self.log_saturation:
+                self.total_frames += 1
+                bg_brightness = np.median(roi)
+                if bg_brightness > 250:  # Nearly saturated
+                    self.saturation_count += 1
+
             # Update Interval Stats
-            if val_bright > int_max:
-                int_max = val_bright
+            if val > int_max:
+                int_max = val
                 t_max = now
-            if val_bright < int_min:
-                int_min = val_bright
+            if val < int_min:
+                int_min = val
                 t_min = now
 
-            is_active = val_bright > self.thresh_bright
+            is_active = val > self.thresh_bright
             gap = now - last_pulse
 
             if is_active:
@@ -333,18 +473,30 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 color = "\033[91m" if gap > limit else "\033[92m"
 
                 dt = abs(t_max - t_min)
-                print(f"{color}{status} | Bright: {val_bright:.0f} / {self.thresh_bright:.0f} | "
-                      f"Min/Max: {int_min:.0f}/{int_max:.0f} | dT: {dt:.3f}s\033[0m")
+                metric_label = "Contrast" if self.use_contrast else "Bright"
+                status_line = (f"{color}{status} | {metric_label}: {val:.0f} / {self.thresh_bright:.0f} | "
+                              f"Min/Max: {int_min:.0f}/{int_max:.0f} | dT: {dt:.3f}s")
+
+                # Add saturation indicator
+                if self.log_saturation and self.total_frames > 0:
+                    sat_pct = (self.saturation_count / self.total_frames) * 100
+                    if sat_pct > 10:  # More than 10% saturation
+                        status_line += f" [SAT: {sat_pct:.1f}%]"
+
+                print(f"{status_line}\033[0m")
 
                 # Reset stats
                 last_report = now
                 int_max = 0
-                int_min = 255
+                int_min = 255 if not self.use_contrast else 0
+                if self.log_saturation:
+                    self.saturation_count = 0
+                    self.total_frames = 0
 
             if isinstance(self.cam, X86CameraDriver):
                 debug = frame.copy()
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 1)
-                cv2.putText(debug, f"{val_bright:.0f}", (x1, y1-5),
+                cv2.putText(debug, f"{val:.0f}", (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 255, 0) if is_active else (0, 0, 255), 2)
                 cv2.imshow("Monitor", debug)
@@ -352,15 +504,76 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     break
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--interval", type=float, default=60.0)
-    parser.add_argument("-t", "--threshold", type=float, default=50.0)
-    parser.add_argument("-d", "--debug", action="store_true")
-    parser.add_argument("-p", "--preview", action="store_true", help="Enable aiming phase")
+    parser = argparse.ArgumentParser(
+        description="LED Detection and Monitoring System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Feature Flags (all enabled by default except adaptive-exposure):
+  --use-contrast        Use contrast (max-median) instead of brightness
+  --adaptive-roi        Automatically size ROI based on LED blob size
+  --adaptive-off        Use variance-based OFF detection
+  --log-saturation      Track and log saturation events
+  --adaptive-exposure   Automatically adjust camera exposure (experimental)
+
+To disable a feature, use --no-<feature>, e.g., --no-use-contrast
+        """)
+
+    parser.add_argument("-i", "--interval", type=float, default=60.0,
+                       help="Expected max time (s) between LED pulses")
+    parser.add_argument("-t", "--threshold", type=float, default=50.0,
+                       help="Minimum signal strength for LED detection")
+    parser.add_argument("-d", "--debug", action="store_true",
+                       help="Enable debug logging")
+    parser.add_argument("-p", "--preview", action="store_true",
+                       help="Enable aiming phase for camera positioning")
+
+    # Feature flags (enabled by default)
+    parser.add_argument("--use-contrast", dest="use_contrast", action="store_true", default=True,
+                       help="Use contrast-based detection (default)")
+    parser.add_argument("--no-use-contrast", dest="use_contrast", action="store_false",
+                       help="Use brightness-based detection (original)")
+
+    parser.add_argument("--adaptive-roi", dest="adaptive_roi", action="store_true", default=True,
+                       help="Auto-size ROI based on LED blob (default)")
+    parser.add_argument("--no-adaptive-roi", dest="adaptive_roi", action="store_false",
+                       help="Use fixed 64x64 ROI")
+
+    parser.add_argument("--adaptive-off", dest="adaptive_off", action="store_true", default=True,
+                       help="Use variance-based OFF detection (default)")
+    parser.add_argument("--no-adaptive-off", dest="adaptive_off", action="store_false",
+                       help="Use fixed 60% drop threshold")
+
+    parser.add_argument("--log-saturation", dest="log_saturation", action="store_true", default=True,
+                       help="Track saturation events (default)")
+    parser.add_argument("--no-log-saturation", dest="log_saturation", action="store_false",
+                       help="Disable saturation logging")
+
+    parser.add_argument("--adaptive-exposure", dest="adaptive_exposure", action="store_true", default=False,
+                       help="Auto-adjust camera exposure (experimental, X86 only)")
+
     args = parser.parse_args()
 
     setup_logging(args.debug)
-    monitor = PeakMonitor(args.interval, args.threshold, args.preview)
+
+    # Log enabled features
+    if args.debug:
+        logging.debug("Feature flags:")
+        logging.debug("  use_contrast: %s", args.use_contrast)
+        logging.debug("  adaptive_roi: %s", args.adaptive_roi)
+        logging.debug("  adaptive_off: %s", args.adaptive_off)
+        logging.debug("  log_saturation: %s", args.log_saturation)
+        logging.debug("  adaptive_exposure: %s", args.adaptive_exposure)
+
+    monitor = PeakMonitor(
+        args.interval,
+        args.threshold,
+        args.preview,
+        use_contrast=args.use_contrast,
+        adaptive_roi=args.adaptive_roi,
+        adaptive_off=args.adaptive_off,
+        log_saturation=args.log_saturation,
+        adaptive_exposure=args.adaptive_exposure
+    )
 
     def cleanup(_s, _f):
         """Signal handler for cleanup."""
