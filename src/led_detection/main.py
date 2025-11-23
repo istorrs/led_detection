@@ -156,6 +156,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # Saturation tracking
         self.saturation_count = 0
         self.total_frames = 0
+        self.min_while_on = 0  # Track minimum value during prolonged ON state
 
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
@@ -418,13 +419,17 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             abs_cond = curr_val < abs_threshold
 
             if drop_cond or abs_cond:
-                logging.info("LED OFF Confirmed (High: %.1f -> Low: %.1f)", high_val, curr_val)
-                time.sleep(0.5) # Allow settling
+                # Found an OFF state - accept it immediately
+                # This works even if LED is flashing, we just catch it during OFF phase
+                logging.info("LED OFF Confirmed (Curr: %.1f < Threshold: %.1f)",
+                           curr_val, drop_threshold)
+                time.sleep(0.1) # Brief settling
                 return True
 
-            # Replaced sys.stdout.write with logging.info
-            logging.info("Waiting for drop... Curr: %.0f (Threshold: %.0f)",
-                        curr_val, drop_threshold)
+            # Only log periodically to avoid spam
+            if int(time.time() - start) % 2 == 0:  # Every 2 seconds
+                logging.info("Waiting for drop... Curr: %.0f (Threshold: %.0f)",
+                           curr_val, drop_threshold)
             time.sleep(0.1)
 
         logging.warning("Timeout waiting for LED off! Noise floor might be inaccurate.")
@@ -490,6 +495,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
         last_pulse = time.time()
         self.led_state = False  # Reset LED state
+        last_off_time = last_pulse  # Track last time LED was truly OFF
 
         # Stats aggregation
         report_period = 1.0
@@ -520,8 +526,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             # Saturation tracking
             if self.log_saturation:
                 self.total_frames += 1
-                bg_brightness = np.median(roi)
-                if bg_brightness > 250:  # Nearly saturated
+                if np.percentile(roi, 95) >= 250:
                     self.saturation_count += 1
 
             # Update Interval Stats
@@ -532,25 +537,49 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 int_min = val
                 t_min = now
 
-            # Adaptive Threshold Update
-            # If value is low (likely OFF), update noise floor
-            # We use a margin below the threshold to safely identify OFF state
-            if val < (self.current_noise_floor + self.calibrated_signal_strength * 0.2):
+            # Check if LED is active (must be calculated before adaptive threshold update)
+            is_active = val > self.thresh_bright
+            gap = now - last_pulse
+
+            # Adaptive Threshold Update (Bidirectional)
+            # Track noise floor changes in both directions (brightening and dimming)
+            if not is_active:
+                # LED is OFF - update noise floor directly
+                last_off_time = now  # Update last OFF time
                 self.noise_floor_history.append(val)
                 if len(self.noise_floor_history) > self.noise_floor_window:
                     self.noise_floor_history.pop(0)
 
                 # Recalculate noise floor and threshold
                 self.current_noise_floor = np.mean(self.noise_floor_history)
-
-                # Update threshold: Noise + 50% of original Signal Strength
-                # We assume the LED adds a constant amount of light (signal strength)
-                # regardless of the ambient noise floor (within linear range).
                 self.thresh_bright = (self.current_noise_floor +
                                      (self.calibrated_signal_strength * 0.5))
+            else:
+                # LED is ON - check if we've been stuck in ON state for too long
+                # Use time since last OFF state, not time since last pulse
+                time_since_off = now - last_off_time
 
-            is_active = val > self.thresh_bright
-            gap = now - last_pulse
+                # Track minimum value while in ON state (doesn't reset with report period)
+                if time_since_off < 0.1:
+                    self.min_while_on = val
+                else:
+                    self.min_while_on = min(self.min_while_on, val)
+
+                if (time_since_off > 5.0 and
+                    self.min_while_on > (self.current_noise_floor +
+                              self.calibrated_signal_strength * 0.3)):
+                    # The minimum value we're seeing is significantly higher than expected
+                    # This suggests ambient light has increased
+                    self.noise_floor_history.append(self.min_while_on)
+                    if len(self.noise_floor_history) > self.noise_floor_window:
+                        self.noise_floor_history.pop(0)
+
+                    # Recalculate noise floor and threshold
+                    self.current_noise_floor = np.mean(self.noise_floor_history)
+                    self.thresh_bright = (self.current_noise_floor +
+                                         (self.calibrated_signal_strength * 0.5))
+                    # Reset min_while_on after updating
+                    self.min_while_on = val
 
             if is_active:
                 if not self.led_state:
@@ -576,8 +605,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
                 dt = abs(t_max - t_min)
                 metric_label = "Contrast" if self.use_contrast else "Bright"
-                status_line = (f"{color}{status} | {metric_label}: {val:.0f} / "
-                              f"{self.thresh_bright:.0f} | "
+                status_line = (f"{color}{status} | {metric_label}: {val:.0f} | "
+                              f"Thr: {self.thresh_bright:.0f} "
+                              f"(Floor: {self.current_noise_floor:.0f}) | "
                               f"Min/Max: {int_min:.0f}/{int_max:.0f} | dT: {dt:.3f}s")
 
                 # Add saturation indicator
