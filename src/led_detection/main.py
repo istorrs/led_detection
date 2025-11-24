@@ -755,8 +755,10 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
             # Adaptive Threshold Update (Bidirectional)
             # Track noise floor changes in both directions (brightening and dimming)
-            if not is_active:
-                # LED is OFF - update noise floor directly
+            # BUT: freeze updates for 3s after exposure changes to avoid contamination
+            time_since_exposure_adjust = now - self.last_exposure_adjust
+            if not is_active and time_since_exposure_adjust > 3.0:
+                # LED is OFF AND enough time has passed since exposure adjustment
                 last_off_time = now  # Update last OFF time
                 self.noise_floor_history.append(val)
                 if len(self.noise_floor_history) > self.noise_floor_window:
