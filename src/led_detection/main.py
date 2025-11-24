@@ -163,6 +163,10 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.total_frames = 0
         self.min_while_on = 0  # Track minimum value during prolonged ON state
 
+        # Continuous adaptive exposure
+        self.saturation_window = []  # Rolling window of saturation percentages
+        self.last_exposure_adjust = 0  # Time of last exposure adjustment
+
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
         if self.use_contrast:
@@ -670,7 +674,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         t_max = last_pulse
         t_min = last_pulse
 
-        while True:
+        while True:  # pylint: disable=too-many-nested-blocks
             # Capture frame
             frame = self.cam.get_frame() # Changed from read_frame() to get_frame()
             if frame is None:
@@ -687,11 +691,55 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             val = self._measure_roi(roi) # Changed from get_signal_strength() to _measure_roi()
             now = time.time()
 
-            # Saturation tracking
+            # Saturation tracking and continuous adaptive exposure
             if self.log_saturation:
                 self.total_frames += 1
-                if np.percentile(roi, 95) >= 250:
+                sat_pct = np.percentile(roi, 95) >= 250
+                if sat_pct:
                     self.saturation_count += 1
+
+                # Continuous adaptive exposure: track saturation over time
+                if self.adaptive_exposure and isinstance(self.cam, X86CameraDriver):
+                    # Calculate rolling saturation percentage
+                    self.saturation_window.append(1 if sat_pct else 0)
+                    if len(self.saturation_window) > 30:  # 30-frame window (~1 second)
+                        self.saturation_window.pop(0)
+
+                    # Bidirectional adaptive exposure
+                    time_since_adjust = now - self.last_exposure_adjust
+                    if len(self.saturation_window) >= 10 and time_since_adjust > 2.0:
+                        recent_sat_pct = sum(self.saturation_window) / len(self.saturation_window)
+                        current_exposure = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
+
+                        # Check if we need to reduce exposure (too saturated)
+                        if recent_sat_pct > 0.5:
+                            # More than 50% of recent frames saturated - reduce exposure
+                            new_exposure = current_exposure * 0.7
+                            self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+                            self.last_exposure_adjust = now
+                            logging.info("Continuous Exposure: Saturation %.0f%%, "
+                                       "reducing %.1f→%.1f",
+                                       recent_sat_pct * 100, current_exposure, new_exposure)
+                            self.saturation_window = []
+
+                        # Check if we need to increase exposure (signal too weak)
+                        elif recent_sat_pct < 0.05:  # Less than 5% saturation
+                            # Check if signal strength is low
+                            # Only increase if we're detecting pulses but they're weak
+                            if val > self.thresh_bright:  # Currently in a pulse
+                                signal_strength = val - self.current_noise_floor
+                                # If signal is weak relative to calibrated strength
+                                if signal_strength < self.calibrated_signal_strength * 0.5:
+                                    # Cap at initial exposure
+                                    new_exposure = min(current_exposure * 1.3, 83.0)
+                                    self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+                                    self.last_exposure_adjust = now
+                                    logging.info("Continuous Exposure: Signal weak (%.0f < %.0f), "
+                                               "increasing %.1f→%.1f",
+                                               signal_strength,
+                                               self.calibrated_signal_strength * 0.5,
+                                               current_exposure, new_exposure)
+                                    self.saturation_window = []
 
             # Update Interval Stats
             if val > int_max:
