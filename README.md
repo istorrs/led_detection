@@ -305,6 +305,22 @@ ls -lh debug_detection.png
 3. **LED flash too brief**: Check `dT` value (should match LED pulse width)
    - If `dT < 10ms`, LED may be too fast for camera framerate
 
+### Saturation / Contrast Blindness (High Brightness LED)
+
+**Symptoms:** LED detection becomes erratic or fails when LED brightness increases to 100%.
+- Logs show `[SAT: 90%+]`
+- Contrast score drops to near zero despite bright LED
+
+**Cause:**
+- The LED bloom fills the entire ROI (Region of Interest)
+- Both `max(ROI)` and `median(ROI)` become 255 (saturated)
+- `Contrast = Max - Median = 255 - 255 = 0`
+- The system thinks the LED is OFF because there is no contrast *within* the ROI
+
+**Solution:**
+- **Adaptive Exposure (Enabled by Default):** Automatically reduces exposure time when saturation is detected, restoring contrast.
+- **Increase ROI Size:** Disable adaptive ROI (`--no-adaptive-roi`) to use a larger fixed box that isn't filled by the bloom.
+
 ### Flashlight Interference (Contrast Mode)
 
 **Expected Behavior:** System should continue detecting LED even when flashlight is shined on scene
@@ -358,7 +374,8 @@ python3 src/led_detection/main.py --interval 60 --debug
 | `--adaptive-roi` | ✅ ON | Auto-size ROI based on blob | Disable if ROI detection fails |
 | `--adaptive-off` | ✅ ON | Variance-based OFF detection | Disable for very stable LED timing |
 | `--log-saturation` | ✅ ON | Track sensor saturation | Disable to reduce log spam |
-| `--adaptive-exposure` | ❌ OFF | Auto-adjust camera exposure | Enable for very bright/dark scenes |
+| `--adaptive-exposure` | ✅ ON | Auto-adjust camera exposure | Disable if exposure oscillates |
+| `--autofocus` | ❌ OFF | Auto-focus sweep (X86 only) | Enable for sharp focus |
 
 **To disable a feature:**
 ```bash

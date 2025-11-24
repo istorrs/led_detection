@@ -127,11 +127,13 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                  adaptive_roi=True,      # 1b: Adaptive ROI sizing
                  adaptive_off=True,      # 1c: Adaptive OFF detection
                  log_saturation=True,    # 2a: Saturation logging
-                 adaptive_exposure=False,# 2b: Adaptive exposure (experimental)
-                 autofocus=False         # 2c: Autofocus sweep (experimental)
+                 adaptive_exposure=True, # 2b: Adaptive exposure (experimental)
+                 autofocus=False,        # 2c: Autofocus sweep (experimental)
+                 min_pulse_duration=100  # 3a: Minimum pulse duration (ms)
                 ):
         self.cam = get_driver()
         self.interval = interval
+        self.min_pulse_duration = min_pulse_duration
         self.preview = preview
         self.roi = None
         self.thresh_bright = 0.0
@@ -153,6 +155,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.current_noise_floor = 0.0
         self.calibrated_signal_strength = 0.0  # Initialize
         self.led_state = False  # Initialize
+        self.led_on_time = 0  # Track when LED turned ON
         self.scan_timeout = 70.0 # Default scan timeout
 
         # Saturation tracking
@@ -295,11 +298,18 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 # Use blob size with 1.1x margin (0.55 * dimension for half-width)
                 raw_size = int(max(blob_w, blob_h) * 0.55)
                 size = max(12, min(48, raw_size))  # Constrain between 24x24 and 96x96
-                logging.info("Adaptive ROI: Blob=%dx%d, RawHalf=%d, FinalHalf=%d",
-                            blob_w, blob_h, raw_size, size)
+
+                # Use blob centroid for better centering
+                centroid_x = int(bbox[0] + bbox[2] / 2)
+                centroid_y = int(bbox[1] + bbox[3] / 2)
+
+                c_x, c_y = centroid_x, centroid_y
+
+                logging.info("Adaptive ROI: Blob=%dx%d, RawHalf=%d, FinalHalf=%d, Center=(%d,%d)",
+                           blob_w, blob_h, raw_size, size, c_x, c_y)
             else:
-                size = 32  # Fallback
-                logging.warning("Peak not in any blob, using default ROI size (32)")
+                size = 32  # Fallback to default half-size (64x64)
+                logging.warning("Peak not in connected component? Using default ROI size.")
         else:
             # Fixed ROI (original behavior)
             size = 32
@@ -372,8 +382,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         logging.info("Adaptive exposure complete after %d iterations", iteration + 1)
 
     def autofocus_sweep(self):
-        """Automatically find optimal focus position using Laplacian variance."""
-        # pylint: disable=too-many-locals
+        """Automatically find optimal focus using bidirectional hill-climbing algorithm."""
+        # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         if not self.autofocus:
             return
 
@@ -381,107 +391,142 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             logging.info("Autofocus only supported for X86CameraDriver")
             return
 
-        logging.info("Starting autofocus sweep...")
+        logging.info("Starting autofocus sweep (hill-climbing algorithm)...")
 
-        # Capture and save initial image
-        initial_frame = self.cam.get_frame()
+        # Helper function to measure sharpness with proper settling
+        def measure_sharpness(focus_pos, settle_time=0.5):
+            """Set focus and measure sharpness after settling."""
+            self.cam.cap.set(cv2.CAP_PROP_FOCUS, focus_pos)
+            time.sleep(settle_time)  # Critical: wait for motor to settle
+
+            frame = self.cam.get_frame()
+            if frame is None:
+                return 0
+
+            # Measure sharpness in center region
+            h, w = frame.shape[:2]
+            center_h, center_w = h // 2, w // 2
+            roi_size = min(h, w) // 3
+            y1, y2 = center_h - roi_size // 2, center_h + roi_size // 2
+            x1, x2 = center_w - roi_size // 2, center_w + roi_size // 2
+
+            center_roi = frame[y1:y2, x1:x2]
+            sharpness = cv2.Laplacian(center_roi, cv2.CV_64F).var()
+
+            # Show preview if enabled
+            if self.preview or self.autofocus:
+                preview_frame = frame.copy()
+                cv2.rectangle(preview_frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                cv2.putText(preview_frame, f"Focus: {focus_pos} | Sharp: {sharpness:.1f}",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.imshow("Autofocus Sweep", preview_frame)
+                cv2.waitKey(1)
+
+            return sharpness, frame
+
+        # Capture initial state
+        initial_focus = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
+        initial_sharpness, initial_frame = measure_sharpness(initial_focus)
+
         if initial_frame is not None:
             cv2.imwrite("autofocus_initial.png", initial_frame)
             logging.info("Saved autofocus_initial.png")
 
-            # Calculate initial sharpness
-            initial_sharpness = cv2.Laplacian(initial_frame, cv2.CV_64F).var()
-            logging.info("Initial focus sharpness: %.2f", initial_sharpness)
+        logging.info("Initial focus: %d, sharpness: %.2f", initial_focus, initial_sharpness)
 
-        # Coarse sweep: test every 10 positions from 0 to 255
-        logging.info("Performing coarse focus sweep (0-255, step 10)...")
-        focus_scores = []
-        focus_positions = list(range(0, 256, 10))
+        # Hill-climbing parameters
+        coarse_step = 15  # Larger steps for coarse search
+        fine_step = 3     # Smaller steps for fine tuning
 
-        for pos in focus_positions:
-            self.cam.cap.set(cv2.CAP_PROP_FOCUS, pos)
-            time.sleep(0.2)  # Allow camera to settle
+        best_focus = initial_focus
+        best_sharpness = initial_sharpness
 
-            frame = self.cam.get_frame()
-            if frame is None:
-                continue
+        # Phase 1: Coarse search in both directions
+        logging.info("Phase 1: Coarse bidirectional search (step=%d)...", coarse_step)
 
-            # Calculate sharpness using Laplacian variance
-            # Higher variance = sharper image
-            sharpness = cv2.Laplacian(frame, cv2.CV_64F).var()
-            focus_scores.append((pos, sharpness))
+        for direction in [+1, -1]:  # Try both directions
+            current_focus = initial_focus
+            current_sharpness = initial_sharpness
+            improving = True
 
-            logging.debug("Focus position %d: sharpness %.2f", pos, sharpness)
+            direction_name = "forward" if direction > 0 else "backward"
+            logging.info("  Searching %s from %d...", direction_name, current_focus)
 
-            # Show preview if enabled
-            if self.preview or self.autofocus:
-                preview_frame = frame.copy()
-                cv2.putText(preview_frame, f"Focus: {pos} | Sharpness: {sharpness:.1f}",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255), 2)
-                cv2.imshow("Autofocus Sweep", preview_frame)
-                cv2.waitKey(1)
+            while improving:
+                # Try next position
+                next_focus = current_focus + (direction * coarse_step)
 
-        # Find best coarse position
-        if not focus_scores:
-            logging.warning("No focus scores collected, autofocus failed")
-            return
+                # Bounds check
+                if next_focus < 0 or next_focus > 255:
+                    logging.debug("    Hit boundary at %d", next_focus)
+                    break
 
-        best_coarse_pos, best_coarse_sharpness = max(focus_scores, key=lambda x: x[1])
-        logging.info("Best coarse position: %d (sharpness: %.2f)",
-                    best_coarse_pos, best_coarse_sharpness)
+                next_sharpness, _ = measure_sharpness(next_focus)
+                logging.debug("    Focus %d: sharpness %.2f", next_focus, next_sharpness)
 
-        # Fine sweep: search ±10 around best position with step of 2
-        fine_start = max(0, best_coarse_pos - 10)
-        fine_end = min(255, best_coarse_pos + 10)
-        logging.info("Performing fine focus sweep (%d-%d, step 2)...", fine_start, fine_end)
+                # Check if we're improving
+                if next_sharpness > current_sharpness * 1.02:  # At least 2% improvement
+                    current_focus = next_focus
+                    current_sharpness = next_sharpness
 
-        fine_scores = []
-        for pos in range(fine_start, fine_end + 1, 2):
-            self.cam.cap.set(cv2.CAP_PROP_FOCUS, pos)
-            time.sleep(0.15)  # Slightly faster for fine sweep
+                    # Update best if this is better
+                    if current_sharpness > best_sharpness:
+                        best_focus = current_focus
+                        best_sharpness = current_sharpness
+                        logging.info("    New best: focus=%d, sharpness=%.2f",
+                                   best_focus, best_sharpness)
+                else:
+                    # Getting worse, stop this direction
+                    logging.debug("    Stopped improving at %d", next_focus)
+                    improving = False
 
-            frame = self.cam.get_frame()
-            if frame is None:
-                continue
+        # Phase 2: Fine tuning around best position
+        logging.info("Phase 2: Fine tuning around %d (step=%d)...", best_focus, fine_step)
 
-            sharpness = cv2.Laplacian(frame, cv2.CV_64F).var()
-            fine_scores.append((pos, sharpness))
+        # Search ±2 steps around best position
+        fine_start = max(0, best_focus - (fine_step * 2))
+        fine_end = min(255, best_focus + (fine_step * 2))
 
-            logging.debug("Fine focus position %d: sharpness %.2f", pos, sharpness)
+        for focus_pos in range(fine_start, fine_end + 1, fine_step):
+            if focus_pos == best_focus:
+                continue  # Already measured
 
-            # Show preview if enabled
-            if self.preview or self.autofocus:
-                preview_frame = frame.copy()
-                cv2.putText(preview_frame, f"Fine Focus: {pos} | Sharpness: {sharpness:.1f}",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255), 2)
-                cv2.imshow("Autofocus Sweep", preview_frame)
-                cv2.waitKey(1)
+            sharpness, _ = measure_sharpness(focus_pos, settle_time=0.4)
+            logging.debug("  Fine focus %d: sharpness %.2f", focus_pos, sharpness)
 
-        # Find best fine position
-        if fine_scores:
-            best_pos, best_sharpness = max(fine_scores, key=lambda x: x[1])
+            if sharpness > best_sharpness:
+                best_focus = focus_pos
+                best_sharpness = sharpness
+                logging.info("  Fine tuning improved: focus=%d, sharpness=%.2f",
+                           best_focus, best_sharpness)
+
+        # Decide whether to apply new focus
+        improvement_pct = ((best_sharpness - initial_sharpness) / initial_sharpness * 100) \
+                         if initial_sharpness > 0 else 0
+
+        if best_sharpness > initial_sharpness * 1.05:  # At least 5% improvement
+            # Apply best focus
+            final_sharpness, final_frame = measure_sharpness(best_focus)
+
+            logging.info("✓ Autofocus improved: %d→%d, Sharpness: %.2f→%.2f (+%.1f%%)",
+                        initial_focus, best_focus, initial_sharpness, final_sharpness,
+                        improvement_pct)
         else:
-            best_pos, best_sharpness = best_coarse_pos, best_coarse_sharpness
+            # Revert to initial - it was better
+            final_sharpness, final_frame = measure_sharpness(initial_focus)
 
-        # Set final focus position
-        self.cam.cap.set(cv2.CAP_PROP_FOCUS, best_pos)
-        time.sleep(0.3)  # Allow camera to settle on final position
+            logging.warning("✗ Autofocus did not improve (%.1f%% change). "
+                          "Keeping initial position %d",
+                          improvement_pct, initial_focus)
 
-        # Capture and save final image
-        final_frame = self.cam.get_frame()
+        # Save final image
         if final_frame is not None:
             cv2.imwrite("autofocus_final.png", final_frame)
             logging.info("Saved autofocus_final.png")
 
-        # Close preview window if it was opened
+        # Close preview window
         if self.preview or self.autofocus:
             cv2.destroyWindow("Autofocus Sweep")
-
-        logging.info("Autofocus complete: Best position=%d, Sharpness=%.2f "
-                    "(Initial: %.2f, Improvement: %.1f%%)",
-                    best_pos, best_sharpness, initial_sharpness,
-                    ((best_sharpness - initial_sharpness) / initial_sharpness * 100)
-                    if initial_sharpness > 0 else 0)
 
     def wait_for_led_off(self):
         """ Monitors ROI brightness until it drops significanty """
@@ -510,10 +555,12 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             # If std is very high (e.g. flashing), 3*sigma might be huge, making threshold too low.
             # We clamp the std effect to avoid unreachable thresholds.
             effective_std = min(noise_std, initial_mean * 0.1)
-            drop_threshold = max(initial_mean - (3 * effective_std), initial_mean * 0.7)
+            # Calculate threshold (Mean - 2*StdDev) - Relaxed from 3*StdDev
+            # Also ensure it's at least 10% below the mean
+            drop_threshold = min(initial_mean - 2.0 * effective_std, initial_mean * 0.9)
 
             logging.info("Adaptive OFF: Initial=%.1f, Std=%.1f, EffStd=%.1f, Threshold=%.1f",
-                        initial_mean, noise_std, effective_std, drop_threshold)
+                       initial_mean, noise_std, effective_std, drop_threshold)
         else:
             # Fixed threshold (original behavior)
             drop_threshold = high_val * 0.6
@@ -702,13 +749,21 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 if not self.led_state:
                     # LED just turned ON
                     self.led_state = True
+                    self.led_on_time = now
             else:
                 if self.led_state:
                     # LED just turned OFF
                     self.led_state = False
-                    last_pulse = now
-                    if gap > 0.5: # Reduced from 2.0s to catch faster pulses
-                        sys.stdout.write(f"\033[96m[PULSE DETECTED] Gap: {gap:.1f}s \033[0m\n")
+                    duration = (now - self.led_on_time) * 1000 # ms
+
+                    # Filter out short noise spikes
+                    if duration > self.min_pulse_duration:
+                        last_pulse = now
+                        if gap > 0.5: # Reduced from 2.0s to catch faster pulses
+                            sys.stdout.write(f"\033[96m[PULSE DETECTED] Gap: {gap:.1f}s | "
+                                           f"Duration: {duration:.0f}ms\033[0m\n")
+                    else:
+                        logging.debug("Ignored short pulse: %.0fms", duration)
 
             # Report every second
             if now - last_report > report_period:
@@ -801,12 +856,16 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
                        help="Disable saturation logging")
 
     parser.add_argument("--adaptive-exposure", dest="adaptive_exposure",
-                       action="store_true", default=False,
+                       action="store_true", default=True,
                        help="Auto-adjust exposure (experimental, X86 only)")
 
     parser.add_argument("--autofocus", dest="autofocus",
                        action="store_true", default=False,
                        help="Auto-focus using Laplacian variance sweep (experimental, X86 only)")
+
+    parser.add_argument("--min-pulse-duration", dest="min_pulse_duration",
+                       type=int, default=200,
+                       help="Minimum pulse duration in ms to count as valid (default: 200)")
 
     args = parser.parse_args()
 
@@ -831,7 +890,8 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
         adaptive_off=args.adaptive_off,
         log_saturation=args.log_saturation,
         adaptive_exposure=args.adaptive_exposure,
-        autofocus=args.autofocus
+        autofocus=args.autofocus,
+        min_pulse_duration=args.min_pulse_duration
     )
 
     def cleanup(_s, _f):
