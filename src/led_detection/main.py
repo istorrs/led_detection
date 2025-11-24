@@ -864,8 +864,8 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
                        help="Auto-focus using Laplacian variance sweep (experimental, X86 only)")
 
     parser.add_argument("--min-pulse-duration", dest="min_pulse_duration",
-                       type=int, default=200,
-                       help="Minimum pulse duration in ms to count as valid (default: 200)")
+                       type=int, default=50,
+                       help="Minimum pulse duration in ms to count as valid (default: 50)")
 
     args = parser.parse_args()
 
