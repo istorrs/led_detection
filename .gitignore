@@ -153,3 +153,4 @@ src/led_detection/autofocus_final.png
 src/led_detection/autofocus_initial.png
 .gitignore
 src/led_detection/debug_detection.png
+debug_detection.png

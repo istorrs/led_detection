@@ -95,11 +95,46 @@ class X86CameraDriver(CameraDriver):
         self.cap.set(cv2.CAP_PROP_GAIN, 0)
         self.cap.set(cv2.CAP_PROP_FOCUS, 128)  # Mid-range focus as compromise
 
+        # Optimize latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Log info
+        self.log_camera_info()
+
         # Debug: Print actual settings
-        print(f"[Debug] Exposure: {self.cap.get(cv2.CAP_PROP_EXPOSURE)}")
-        print(f"[Debug] Gain: {self.cap.get(cv2.CAP_PROP_GAIN)}")
-        print(f"[Debug] Focus: {self.cap.get(cv2.CAP_PROP_FOCUS)}")
+        logging.info("[Debug] Exposure: %s", self.cap.get(cv2.CAP_PROP_EXPOSURE))
+        logging.info("[Debug] Gain: %s", self.cap.get(cv2.CAP_PROP_GAIN))
+        logging.info("[Debug] Focus: %s", self.cap.get(cv2.CAP_PROP_FOCUS))
         time.sleep(0.5)
+
+    def log_camera_info(self):
+        """Log available camera information."""
+        logging.info("--- Camera Information ---")
+        try:
+            backend = self.cap.getBackendName()
+            logging.info("Backend: %s", backend)
+
+            w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            logging.info("Resolution: %sx%s", w, h)
+
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            logging.info("FPS: %s", fps)
+
+            fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+            # Handle case where fourcc might be 0 or invalid
+            if fourcc != 0:
+                fourcc_str = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
+                logging.info("FourCC: %s (%s)", fourcc, fourcc_str)
+            else:
+                logging.info("FourCC: %s", fourcc)
+
+            buf_size = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
+            logging.info("Buffer Size: %s", buf_size)
+
+        except (AttributeError, cv2.error) as e:
+            logging.error("Error reading camera info: %s", e)
+        logging.info("--------------------------")
 
     def stop(self):
         self.cap.release()
