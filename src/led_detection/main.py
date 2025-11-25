@@ -6,6 +6,7 @@ import signal
 import logging
 import argparse
 import os
+from datetime import datetime
 import numpy as np
 import cv2
 
@@ -20,10 +21,17 @@ SYS_OS = platform.system()
 if SYS_OS == "Linux":
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
+def get_timestamp():
+    """Get formatted timestamp with milliseconds."""
+    now = datetime.now()
+    return now.strftime('%H:%M:%S.%f')[:-3]
+
 def setup_logging(debug_mode):
     """Set up logging configuration."""
     level = logging.DEBUG if debug_mode else logging.INFO
-    logging.basicConfig(level=level, format='[%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+    logging.basicConfig(level=level,
+                        format='[%(asctime)s.%(msecs)03d] [%(levelname)s] %(message)s',
+                        datefmt='%H:%M:%S')
 
 # --- DRIVERS ---
 class CameraDriver:
@@ -755,10 +763,11 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
             # Adaptive Threshold Update (Bidirectional)
             # Track noise floor changes in both directions (brightening and dimming)
-            # BUT: freeze updates for 3s after exposure changes to avoid contamination
+            # Freeze updates for 3s after exposure changes to avoid contamination
             time_since_exposure_adjust = now - self.last_exposure_adjust
+
             if not is_active and time_since_exposure_adjust > 3.0:
-                # LED is OFF AND enough time has passed since exposure adjustment
+                # LED is OFF AND exposure has stabilized (3s since last adjustment)
                 last_off_time = now  # Update last OFF time
                 self.noise_floor_history.append(val)
                 if len(self.noise_floor_history) > self.noise_floor_window:
@@ -810,8 +819,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     if duration > self.min_pulse_duration:
                         last_pulse = now
                         if gap > 0.5: # Reduced from 2.0s to catch faster pulses
-                            sys.stdout.write(f"\033[96m[PULSE DETECTED] Gap: {gap:.1f}s | "
-                                           f"Duration: {duration:.0f}ms\033[0m\n")
+                            timestamp = get_timestamp()
+                            sys.stdout.write(f"\033[96m[{timestamp}] [PULSE DETECTED] "
+                                           f"Gap: {gap:.1f}s | Duration: {duration:.0f}ms\033[0m\n")
                     else:
                         logging.debug("Ignored short pulse: %.0fms", duration)
 
@@ -827,7 +837,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
                 dt = abs(t_max - t_min)
                 metric_label = "Contrast" if self.use_contrast else "Bright"
-                status_line = (f"{color}{status} | {metric_label}: {val:.0f} | "
+                timestamp = get_timestamp()
+                status_line = (f"{color}[{timestamp}] {status} | {metric_label}: {val:.0f} | "
                               f"Thr: {self.thresh_bright:.0f} "
                               f"(Floor: {self.current_noise_floor:.0f}) | "
                               f"Min/Max: {int_min:.0f}/{int_max:.0f} | dT: {dt:.3f}s")
