@@ -10,12 +10,6 @@ from datetime import datetime
 import numpy as np
 import cv2
 
-def add(a, b):
-    """
-    Add two numbers.
-    """
-    return a + b
-
 # --- SYSTEM SETUP ---
 SYS_OS = platform.system()
 if SYS_OS == "Linux":
@@ -816,7 +810,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     duration = (now - self.led_on_time) * 1000 # ms
 
                     # Filter out short noise spikes
-                    if duration > self.min_pulse_duration:
+                    if duration >= self.min_pulse_duration:
                         last_pulse = now
                         if gap > 0.5: # Reduced from 2.0s to catch faster pulses
                             timestamp = get_timestamp()
@@ -925,8 +919,8 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
                        help="Auto-focus using Laplacian variance sweep (experimental, X86 only)")
 
     parser.add_argument("--min-pulse-duration", dest="min_pulse_duration",
-                       type=int, default=50,
-                       help="Minimum pulse duration in ms to count as valid (default: 50)")
+                       type=int, default=25,
+                       help="Minimum pulse duration in ms to count as valid (default: 25)")
 
     args = parser.parse_args()
 
