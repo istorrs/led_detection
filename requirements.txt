@@ -19,6 +19,7 @@ pre_commit==4.4.0
 Pygments==2.19.2
 pylint==4.0.3
 pytest==9.0.1
+pytest-cov
 PyYAML==6.0.3
 tomlkit==0.13.3
 virtualenv==20.35.4

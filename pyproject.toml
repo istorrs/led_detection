@@ -40,7 +40,21 @@ init-hook = "import sys; sys.path.append('src')"
 disable = [
     "C0111", # missing-docstring
     "C0103", # invalid-name
+    "C0302", # too-many-lines
+    "R0912", # too-many-branches
+    "R0915", # too-many-statements
 ]
 
 [tool.pylint.format]
 max-line-length = 100
+
+[tool.pylint.tests]
+# Test-specific overrides
+disable = [
+    "duplicate-code",  # Test helpers often share logic
+    "no-member",  # cv2 members not recognized by pylint
+    "protected-access",  # Tests need to access protected members
+    "too-many-instance-attributes",  # Mock drivers can have many attrs
+    "too-many-public-methods",  # Test classes have many test methods
+    "line-too-long",  # Test assertions can be verbose
+]

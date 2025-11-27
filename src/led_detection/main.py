@@ -6,6 +6,7 @@ import signal
 import logging
 import argparse
 import os
+import shutil
 from datetime import datetime
 import numpy as np
 import cv2
@@ -93,7 +94,13 @@ class X86CameraDriver(CameraDriver):
 
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self.cap.set(cv2.CAP_PROP_GAIN, 0)
-        self.cap.set(cv2.CAP_PROP_FOCUS, 128)  # Mid-range focus as compromise
+        time.sleep(5)
+
+        # Get current focus and set it explicitly to ensure manual mode is active
+        # Some cameras need an actual focus value set to leave autofocus mode
+        current_focus = self.cap.get(cv2.CAP_PROP_FOCUS)
+        self.cap.set(cv2.CAP_PROP_FOCUS, current_focus)
+        logging.info("Set manual focus mode at position: %s", current_focus)
 
         # Optimize latency
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -132,6 +139,14 @@ class X86CameraDriver(CameraDriver):
             buf_size = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
             logging.info("Buffer Size: %s", buf_size)
 
+            # Try to get focus range (not all cameras support this)
+            try:
+                focus_val = self.cap.get(cv2.CAP_PROP_FOCUS)
+                if hasattr(cv2, 'CAP_PROP_FOCUS'):
+                    logging.info("Current Focus: %s", focus_val)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
         except (AttributeError, cv2.error) as e:
             logging.error("Error reading camera info: %s", e)
         logging.info("--------------------------")
@@ -166,12 +181,14 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                  log_saturation=True,    # 2a: Saturation logging
                  adaptive_exposure=True, # 2b: Adaptive exposure (experimental)
                  autofocus=False,        # 2c: Autofocus sweep (experimental)
-                 min_pulse_duration=100  # 3a: Minimum pulse duration (ms)
+                 min_pulse_duration=100, # 3a: Minimum pulse duration (ms)
+                 window_name="Detection Monitor" # 4a: Custom window name
                 ):
         self.cam = get_driver()
         self.interval = interval
         self.min_pulse_duration = min_pulse_duration
         self.preview = preview
+        self.window_name = window_name
         self.roi = None
         self.thresh_bright = 0.0
         self.min_signal_strength = threshold
@@ -203,6 +220,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # Continuous adaptive exposure
         self.saturation_window = []  # Rolling window of saturation percentages
         self.last_exposure_adjust = 0  # Time of last exposure adjustment
+        self.noise_floor_skip_count = 0  # Track how many updates we've skipped
 
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
@@ -226,7 +244,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             cv2.waitKey(1)
         cv2.destroyWindow("Aiming")
 
-    def detect_signal(self):
+
+    def wait_for_signal(self, timeout=None):
         """Detects the LED signal by looking for bright AND changing pixels."""
         # pylint: disable=too-many-locals
         # 1. Establish baseline
@@ -251,7 +270,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         accum_max_bright = np.zeros_like(baseline) # Track max brightness
 
         start_scan = time.time()
-        while time.time() - start_scan < self.scan_timeout:
+        scan_duration = timeout if timeout is not None else self.scan_timeout
+        while time.time() - start_scan < scan_duration:
             frame = self.cam.get_frame()
             if frame is None:
                 continue
@@ -276,12 +296,33 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             _, max_val, _, max_loc = cv2.minMaxLoc(combined_map)
 
             # Update baseline to adapt to slow lighting changes
-            cv2.accumulateWeighted(gray, baseline.astype(float), 0.1)
-            baseline = baseline.astype(np.uint8)
+            baseline_float = baseline.astype(float)
+            cv2.accumulateWeighted(gray, baseline_float, 0.1)
+            baseline = baseline_float.astype(np.uint8)
+
+            # Debug
+            # logging.info("Frame %d: Max Brightness %d, Max Diff %d, Baseline %d",
+            #              self.cam.frame_count if hasattr(self.cam, 'frame_count') else -1,
+            #              np.max(gray), np.max(diff), np.mean(baseline))
 
             sys.stdout.write(f"\r    Scanning... {time.time()-start_scan:.1f}s | "
                            f"Peak Score: {max_val:.0f} (Req: {self.min_signal_strength:.1f})   ")
             sys.stdout.flush()
+
+            # Visualization
+            if self.preview:
+                vis_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                # Draw status
+                status_color = (0, 255, 0) if max_val > self.min_signal_strength else (0, 0, 255)
+                cv2.putText(vis_frame, f"Score: {max_val:.1f}/{self.min_signal_strength}",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+                # Draw peak location
+                if max_val > 0:
+                    cv2.circle(vis_frame, max_loc, 10, status_color, 2)
+
+                cv2.imshow(self.window_name, vis_frame)
+                cv2.waitKey(1)
 
             if max_val > self.min_signal_strength:
                 # Wait a bit more to ensure we capture the full pulse
@@ -299,6 +340,17 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 self.detected_peak_strength = accum_max_diff[max_loc[1], max_loc[0]]
 
                 logging.info("[Debug] Initial ROI brightness: %.1f", self.detected_on_brightness)
+
+                # Visualize ROI if preview enabled
+                if self.preview:
+                    # Re-draw frame with ROI
+                    vis_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                    cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(vis_frame, "ROI LOCKED", (x1, y1-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.imshow(self.window_name, vis_frame)
+                    cv2.waitKey(1000) # Pause to let user see the ROI
+
                 return True
 
             time.sleep(0.05)
@@ -306,11 +358,6 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         print("")
         return False
 
-    def wait_for_signal(self):
-        """ Stares at scene using Peak Hold to find the LED """
-        logging.info("Scanning for signal... (Max wait: %ss)", self.scan_timeout)
-        print("    [Action] Waiting for LED to turn ON...\n")
-        return self.detect_signal()
 
 
 
@@ -322,7 +369,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
         if self.adaptive_roi and accum_max_diff is not None:
             # Adaptive ROI: measure blob size
-            threshold_val = self.min_signal_strength * 0.5
+            # Use threshold relative to peak to avoid large blobs from global changes
+            peak_val = accum_max_diff[loc[1], loc[0]]
+            threshold_val = max(self.min_signal_strength * 0.5, peak_val * 0.8)
             _, binary = cv2.threshold(accum_max_diff, threshold_val, 255, cv2.THRESH_BINARY)
             binary = binary.astype(np.uint8)
 
@@ -338,7 +387,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
                 # Use blob size with 1.1x margin (0.55 * dimension for half-width)
                 raw_size = int(max(blob_w, blob_h) * 0.55)
-                size = max(12, min(48, raw_size))  # Constrain between 24x24 and 96x96
+                size = max(12, min(32, raw_size))  # Constrain between 24x24 and 64x64
 
                 # Use blob centroid for better centering
                 centroid_x = int(bbox[0] + bbox[2] / 2)
@@ -432,17 +481,50 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             logging.info("Autofocus only supported for X86CameraDriver")
             return
 
+        # Create/clean autofocus debug directory
+        autofocus_dir = "/tmp/autofocus"
+        if os.path.exists(autofocus_dir):
+            shutil.rmtree(autofocus_dir)
+        os.makedirs(autofocus_dir)
+        logging.info("Created autofocus debug directory: %s", autofocus_dir)
+
         logging.info("Starting autofocus sweep (hill-climbing algorithm)...")
 
-        # Helper function to measure sharpness with proper settling
-        def measure_sharpness(focus_pos, settle_time=0.5):
+        # Detect camera's focus range by testing boundaries
+        initial_focus = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
+        logging.info("Detecting camera focus range...")
+
+        # Test upper boundary
+        test_upper = initial_focus + 1000  # larger step to reach max focus range
+        self.cam.cap.set(cv2.CAP_PROP_FOCUS, test_upper)
+        time.sleep(0.1)
+        actual_upper = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
+
+        # Test lower boundary
+        self.cam.cap.set(cv2.CAP_PROP_FOCUS, 0)
+        time.sleep(0.1)
+        actual_lower = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
+
+        # Restore initial focus
+        self.cam.cap.set(cv2.CAP_PROP_FOCUS, initial_focus)
+        time.sleep(0.1)
+
+        # Determine focus range without artificial clamping
+        focus_min = min(actual_lower, initial_focus)
+        focus_max = max(actual_upper, initial_focus)
+        logging.info("Camera focus range: %d to %d (current: %d)",
+                     focus_min, focus_max, initial_focus)
+        # Counter for saved debug images
+        measurement_counter = [0]
+
+        def measure_sharpness(focus_pos, settle_time=0.1, save_image=True):
             """Set focus and measure sharpness after settling."""
             self.cam.cap.set(cv2.CAP_PROP_FOCUS, focus_pos)
             time.sleep(settle_time)  # Critical: wait for motor to settle
 
             frame = self.cam.get_frame()
             if frame is None:
-                return 0
+                return 0, None
 
             # Measure sharpness in center region
             h, w = frame.shape[:2]
@@ -455,91 +537,84 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             sharpness = cv2.Laplacian(center_roi, cv2.CV_64F).var()
 
             # Show preview if enabled
-            if self.preview or self.autofocus:
+            if self.preview:
                 preview_frame = frame.copy()
                 cv2.rectangle(preview_frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
-                cv2.putText(preview_frame, f"Focus: {focus_pos} | Sharp: {sharpness:.1f}",
+                cv2.putText(preview_frame, f"Focus: {focus_pos} | Sharpness: {sharpness:.1f}",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.imshow("Autofocus Sweep", preview_frame)
                 cv2.waitKey(1)
 
+            # Log each measurement
+            logging.info("  Focus position: %d, Sharpness quality: %.2f", focus_pos, sharpness)
+
+            # Save image to debug directory with focus and score in filename
+            if save_image:
+                measurement_counter[0] += 1
+                filename = (f"{measurement_counter[0]:03d}_focus{focus_pos:04d}_"
+                           f"score{sharpness:07.2f}.png")
+                filepath = os.path.join(autofocus_dir, filename)
+                cv2.imwrite(filepath, frame)
+
             return sharpness, frame
 
-        # Capture initial state
-        initial_focus = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
-        initial_sharpness, initial_frame = measure_sharpness(initial_focus)
-
-        if initial_frame is not None:
-            cv2.imwrite("autofocus_initial.png", initial_frame)
-            logging.info("Saved autofocus_initial.png")
-
+        # Capture initial state (already have initial_focus from range detection)
+        logging.info("Initial focus position: %d", initial_focus)
+        initial_sharpness, _ = measure_sharpness(initial_focus)
         logging.info("Initial focus: %d, sharpness: %.2f", initial_focus, initial_sharpness)
 
-        # Hill-climbing parameters
-        coarse_step = 15  # Larger steps for coarse search
-        fine_step = 3     # Smaller steps for fine tuning
+        # Hill-climbing parameters (slower steps for better visibility)
+        # Scale step sizes based on focus range
+        focus_range = focus_max - focus_min
+        coarse_step = max(5, focus_range // 20)  # ~5% of range, minimum 5
+        fine_step = 1  # Maximum precision for fine tuning
+
+        logging.info("Using step sizes: coarse=%d, fine=%d (range=%d)",
+                    coarse_step, fine_step, focus_range)
 
         best_focus = initial_focus
         best_sharpness = initial_sharpness
 
-        # Phase 1: Coarse search in both directions
-        logging.info("Phase 1: Coarse bidirectional search (step=%d)...", coarse_step)
-
-        for direction in [+1, -1]:  # Try both directions
-            current_focus = initial_focus
-            current_sharpness = initial_sharpness
-            improving = True
-
-            direction_name = "forward" if direction > 0 else "backward"
-            logging.info("  Searching %s from %d...", direction_name, current_focus)
-
-            while improving:
-                # Try next position
-                next_focus = current_focus + (direction * coarse_step)
-
-                # Bounds check
-                if next_focus < 0 or next_focus > 255:
-                    logging.debug("    Hit boundary at %d", next_focus)
-                    break
-
-                next_sharpness, _ = measure_sharpness(next_focus)
-                logging.debug("    Focus %d: sharpness %.2f", next_focus, next_sharpness)
-
-                # Check if we're improving
-                if next_sharpness > current_sharpness * 1.02:  # At least 2% improvement
-                    current_focus = next_focus
-                    current_sharpness = next_sharpness
-
-                    # Update best if this is better
-                    if current_sharpness > best_sharpness:
-                        best_focus = current_focus
-                        best_sharpness = current_sharpness
-                        logging.info("    New best: focus=%d, sharpness=%.2f",
-                                   best_focus, best_sharpness)
-                else:
-                    # Getting worse, stop this direction
-                    logging.debug("    Stopped improving at %d", next_focus)
-                    improving = False
-
-        # Phase 2: Fine tuning around best position
-        logging.info("Phase 2: Fine tuning around %d (step=%d)...", best_focus, fine_step)
-
-        # Search ±2 steps around best position
-        fine_start = max(0, best_focus - (fine_step * 2))
-        fine_end = min(255, best_focus + (fine_step * 2))
-
-        for focus_pos in range(fine_start, fine_end + 1, fine_step):
-            if focus_pos == best_focus:
-                continue  # Already measured
-
-            sharpness, _ = measure_sharpness(focus_pos, settle_time=0.4)
-            logging.debug("  Fine focus %d: sharpness %.2f", focus_pos, sharpness)
-
+        # Phase 1: Coarse linear scan across focus range
+        logging.info(
+            "Phase 1: Coarse linear scan from %d to %d with step %d",
+            focus_min, focus_max, coarse_step)
+        for focus_pos in range(focus_min, focus_max + 1, coarse_step):
+            sharpness, _ = measure_sharpness(focus_pos)
             if sharpness > best_sharpness:
                 best_focus = focus_pos
                 best_sharpness = sharpness
-                logging.info("  Fine tuning improved: focus=%d, sharpness=%.2f",
-                           best_focus, best_sharpness)
+                logging.info("    New best: focus=%d, sharpness=%.2f", best_focus, best_sharpness)
+        # Phase 2: Binary search around the best coarse focus
+        left = max(focus_min, best_focus - coarse_step)
+        right = min(focus_max, best_focus + coarse_step)
+        logging.info(
+            "Phase 2: Binary search between %d and %d (initial best=%d)...",
+            left, right, best_focus)
+        while left <= right:
+            mid = (left + right) // 2
+            mid_sharp, _ = measure_sharpness(mid)
+            logging.info("  Tested focus=%d, sharpness=%.2f", mid, mid_sharp)
+            # Evaluate neighbors
+            left_sharp = None
+            right_sharp = None
+            if mid - 1 >= focus_min:
+                left_sharp, _ = measure_sharpness(mid - 1)
+            if mid + 1 <= focus_max:
+                right_sharp, _ = measure_sharpness(mid + 1)
+            # Move towards higher sharpness
+            if left_sharp is not None and left_sharp > mid_sharp:
+                right = mid - 1
+            elif right_sharp is not None and right_sharp > mid_sharp:
+                left = mid + 1
+            else:
+                # Peak found at mid
+                best_focus = mid
+                best_sharpness = mid_sharp
+                logging.info(
+                    "    ✓ Binary search peak: focus=%d, sharpness=%.2f",
+                    best_focus, best_sharpness)
+                break
 
         # Decide whether to apply new focus
         improvement_pct = ((best_sharpness - initial_sharpness) / initial_sharpness * 100) \
@@ -547,26 +622,24 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
         if best_sharpness > initial_sharpness * 1.05:  # At least 5% improvement
             # Apply best focus
-            final_sharpness, final_frame = measure_sharpness(best_focus)
+            final_sharpness, _ = measure_sharpness(best_focus)
 
             logging.info("✓ Autofocus improved: %d→%d, Sharpness: %.2f→%.2f (+%.1f%%)",
                         initial_focus, best_focus, initial_sharpness, final_sharpness,
                         improvement_pct)
         else:
             # Revert to initial - it was better
-            final_sharpness, final_frame = measure_sharpness(initial_focus)
+            final_sharpness, _ = measure_sharpness(initial_focus)
 
             logging.warning("✗ Autofocus did not improve (%.1f%% change). "
                           "Keeping initial position %d",
                           improvement_pct, initial_focus)
 
-        # Save final image
-        if final_frame is not None:
-            cv2.imwrite("autofocus_final.png", final_frame)
-            logging.info("Saved autofocus_final.png")
-
-        # Close preview window
-        if self.preview or self.autofocus:
+        # Keep preview window open for 2 seconds to show final result
+        logging.info("Autofocus complete.")
+        if self.preview:
+            logging.info("Showing final result for 2 seconds...")
+            time.sleep(2.0)
             cv2.destroyWindow("Autofocus Sweep")
 
     def wait_for_led_off(self):
@@ -759,24 +832,59 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                                        recent_sat_pct * 100, current_exposure, new_exposure)
                             self.saturation_window = []
 
-                        # Check if we need to increase exposure (signal too weak)
+                        # Check for high ambient light via skip counter
+                        # Only trigger if we're repeatedly hitting the noise floor cap
+                        elif self.noise_floor_skip_count > 100:  # Cap hit >100 times
+                            # Ambient light has increased significantly
+                            new_exposure = current_exposure * 0.7
+                            self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+                            self.last_exposure_adjust = now
+                            logging.info("Continuous Exposure: Noise floor capped %d times, "
+                                       "reducing %.1f→%.1f",
+                                       self.noise_floor_skip_count,
+                                       current_exposure, new_exposure)
+                            self.saturation_window = []
+                            # Reset noise floor history to recalibrate
+                            self.noise_floor_history = []
+                            self.noise_floor_skip_count = 0
+
+                        # Check if we need to increase exposure (signal too weak OR low ambient)
                         elif recent_sat_pct < 0.05:  # Less than 5% saturation
-                            # Check if signal strength is low
-                            # Only increase if we're detecting pulses but they're weak
+                            # Two scenarios for increasing exposure:
+                            # 1. Signal is weak during pulse detection
+                            # 2. Noise floor has dropped significantly (ambient light removed)
+
+                            should_increase = False
+                            reason = ""
+
+                            # Scenario 1: Weak signal during pulse
                             if val > self.thresh_bright:  # Currently in a pulse
                                 signal_strength = val - self.current_noise_floor
-                                # If signal is weak relative to calibrated strength
                                 if signal_strength < self.calibrated_signal_strength * 0.5:
-                                    # Cap at initial exposure
-                                    new_exposure = min(current_exposure * 1.3, 83.0)
-                                    self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
-                                    self.last_exposure_adjust = now
-                                    logging.info("Continuous Exposure: Signal weak (%.0f < %.0f), "
-                                               "increasing %.1f→%.1f",
-                                               signal_strength,
-                                               self.calibrated_signal_strength * 0.5,
-                                               current_exposure, new_exposure)
-                                    self.saturation_window = []
+                                    should_increase = True
+                                    reason = f"Signal weak ({signal_strength:.0f} < " \
+                                           f"{self.calibrated_signal_strength * 0.5:.0f})"
+
+                            # Scenario 2: Noise floor dropped (ambient light removed)
+                            # Only if we have a stable noise floor history AND exposure is low
+                            elif (len(self.noise_floor_history) >= 5 and
+                                  self.current_noise_floor <
+                                  self.calibrated_signal_strength * 0.1 and
+                                  current_exposure < 70.0):
+                                # Only if exposure is significantly reduced
+                                # Noise floor is very low, can increase exposure
+                                should_increase = True
+                                reason = f"Low ambient (floor={self.current_noise_floor:.0f})"
+
+                            if should_increase:
+                                # Cap at initial exposure
+                                new_exposure = min(current_exposure * 1.3, 83.0)
+                                self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
+                                self.last_exposure_adjust = now
+                                logging.info("Continuous Exposure: %s, "
+                                           "increasing %.1f→%.1f",
+                                           reason, current_exposure, new_exposure)
+                                self.saturation_window = []
 
             # Update Interval Stats
             if val > int_max:
@@ -798,14 +906,47 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             if not is_active and time_since_exposure_adjust > 3.0:
                 # LED is OFF AND exposure has stabilized (3s since last adjustment)
                 last_off_time = now  # Update last OFF time
-                self.noise_floor_history.append(val)
-                if len(self.noise_floor_history) > self.noise_floor_window:
-                    self.noise_floor_history.pop(0)
 
-                # Recalculate noise floor and threshold
-                self.current_noise_floor = np.mean(self.noise_floor_history)
-                self.thresh_bright = (self.current_noise_floor +
-                                     (self.calibrated_signal_strength * 0.5))
+                # Cap noise floor updates to prevent runaway threshold increases
+                # Only update if the new value is reasonable relative to calibrated baseline
+                # Increased from 30% to 60% to allow for higher ambient light
+                max_reasonable_floor = self.calibrated_signal_strength * 0.6
+                if val < max_reasonable_floor or len(self.noise_floor_history) == 0:
+                    self.noise_floor_history.append(val)
+                    if len(self.noise_floor_history) > self.noise_floor_window:
+                        self.noise_floor_history.pop(0)
+
+                    # Recalculate noise floor and threshold
+                    self.current_noise_floor = np.mean(self.noise_floor_history)
+                    self.thresh_bright = (self.current_noise_floor +
+                                         (self.calibrated_signal_strength * 0.5))
+                    # Only reset skip counter if noise floor has dropped significantly
+                    # This allows counter to accumulate during sustained high ambient
+                    if self.current_noise_floor < self.calibrated_signal_strength * 0.3:
+                        self.noise_floor_skip_count = 0
+                else:
+                    # Noise floor is unreasonably high - likely ambient light issue
+                    # Don't update threshold, let exposure adjustment handle it
+                    self.noise_floor_skip_count += 1
+                    # FALLBACK: If we've skipped too many times
+                    # (exposure adjustment failed or maxed out)
+                    # We must accept the new reality to avoid being blind
+                    if self.noise_floor_skip_count > 200:
+                        logging.warning(
+                            "Noise floor stuck high (skipped %d). Forcing update.",
+                            self.noise_floor_skip_count)
+                        self.noise_floor_history.append(val)
+                        if len(self.noise_floor_history) > self.noise_floor_window:
+                            self.noise_floor_history.pop(0)
+                        self.current_noise_floor = np.mean(self.noise_floor_history)
+                        self.thresh_bright = (self.current_noise_floor +
+                                             (self.calibrated_signal_strength * 0.5))
+                        self.noise_floor_skip_count = 0
+
+                    # Only log occasionally to avoid spam (every 50 skips)
+                    elif self.noise_floor_skip_count % 50 == 1:
+                        logging.info("Noise floor capped: val=%.0f > max=%.0f (skipped %d times)",
+                                   val, max_reasonable_floor, self.noise_floor_skip_count)
             else:
                 # LED is ON - check if we've been stuck in ON state for too long
                 # Use time since last OFF state, not time since last pulse
@@ -817,20 +958,33 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 else:
                     self.min_while_on = min(self.min_while_on, val)
 
+                # Only update noise floor from "stuck ON" if reasonable
+                max_reasonable_floor = self.calibrated_signal_strength * 0.6
+
+                # If stuck ON for > 10s, force update even if high
+                force_update = time_since_off > 10.0
+
                 if (time_since_off > 5.0 and
                     self.min_while_on > (self.current_noise_floor +
-                              self.calibrated_signal_strength * 0.3)):
-                    # The minimum value we're seeing is significantly higher than expected
-                    # This suggests ambient light has increased
-                    self.noise_floor_history.append(self.min_while_on)
+                              self.calibrated_signal_strength * 0.3) and
+                    (self.min_while_on < max_reasonable_floor or
+                     force_update)):
+
+                    # If forced, use current if higher than min_while_on
+                    # This helps when stuck on high-contrast clutter
+                    update_val = self.min_while_on
+                    if force_update and val > self.min_while_on:
+                        # Blend min and current to pull average up
+                        update_val = (self.min_while_on + val) / 2.0
+
+                    self.noise_floor_history.append(update_val)
                     if len(self.noise_floor_history) > self.noise_floor_window:
                         self.noise_floor_history.pop(0)
 
-                    # Recalculate noise floor and threshold
                     self.current_noise_floor = np.mean(self.noise_floor_history)
                     self.thresh_bright = (self.current_noise_floor +
                                          (self.calibrated_signal_strength * 0.5))
-                    # Reset min_while_on after updating
+                    # Reset min_while_on to current value to avoid getting stuck on a past low
                     self.min_while_on = val
 
             if is_active:
@@ -898,7 +1052,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 if cv2.waitKey(1) == ord('q'):
                     break
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="LED Detection and Monitoring System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -993,3 +1147,6 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
 
     signal.signal(signal.SIGINT, cleanup)
     monitor.run()
+
+if __name__ == "__main__":
+    main()
