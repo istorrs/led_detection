@@ -449,7 +449,7 @@ flowchart TD
 
     CheckState{LED<br/>State?}
     CheckState -->|OFF| UpdateNoise[Add value to noise_floor_history<br/>Recalculate threshold<br/>threshold = noise_floor + signal×0.5]
-    CheckState -->|ON|  CheckStuck
+    CheckState -->|ON| CheckStuck
 
     CheckStuck{ON for<br/>> 5s?}
     CheckStuck -->|Yes| AmbientCheck{min_value ><br/>noise + 30%?}
