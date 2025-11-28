@@ -73,6 +73,8 @@ This runs with:
 - ✅ Adaptive ROI sizing (handles LEDs at different distances)
 - ✅ Adaptive OFF detection (variance-based)
 - ✅ Saturation logging (warns of overexposure)
+- ✅ Adaptive exposure (auto-adjusts if saturation detected, X86 only)
+- ✅ Autofocus (finds optimal focus automatically, X86 only)
 - ✅ Bidirectional threshold adaptation (tracks ambient light changes)
 
 ### Command-Line Options
@@ -88,9 +90,8 @@ This runs with:
 - `--adaptive-roi` / `--no-adaptive-roi` - Auto-size ROI based on LED blob vs fixed 64×64
 - `--adaptive-off` / `--no-adaptive-off` - Variance-based vs fixed 60% drop for OFF detection
 - `--log-saturation` / `--no-log-saturation` - Track and display saturation warnings
-
-**Experimental Features (Disabled by Default):**
-- `--adaptive-exposure` - Auto-adjust camera exposure (X86 only, may oscillate with some webcams)
+- `--adaptive-exposure` / `--no-adaptive-exposure` - Auto-adjust camera exposure (X86 only)
+- `--autofocus` / `--no-autofocus` - Auto-focus sweep using hill-climbing algorithm (X86 only)
 
 ### Example Commands
 
@@ -375,7 +376,7 @@ python3 src/led_detection/main.py --interval 60 --debug
 | `--adaptive-off` | ✅ ON | Variance-based OFF detection | Disable for very stable LED timing |
 | `--log-saturation` | ✅ ON | Track sensor saturation | Disable to reduce log spam |
 | `--adaptive-exposure` | ✅ ON | Auto-adjust camera exposure | Disable if exposure oscillates |
-| `--autofocus` | ❌ OFF | Auto-focus sweep (X86 only) | Enable for sharp focus |
+| `--autofocus` | ✅ ON | Auto-focus sweep (X86 only) | Disable to use manual focus |
 
 **To disable a feature:**
 ```bash
@@ -389,49 +390,131 @@ python3 src/led_detection/main.py --interval 60 --adaptive-exposure
 
 ---
 
-## 🎯 Algorithm Summary
+## 🎯 Algorithm Flow Chart
 
+```mermaid
+flowchart TD
+    Start([Start Detection]) --> Init[Camera Initialization<br/>Manual exposure, 60fps<br/>Disable HW autofocus]
+    Init --> Preview{Preview<br/>Mode?}
+    Preview -->|Yes| Aim[5s Aiming Phase<br/>Preview Window]
+    Preview -->|No| AutofocusCheck
+    Aim --> AutofocusCheck
+
+    AutofocusCheck{Autofocus<br/>Enabled?}
+    AutofocusCheck -->|Yes X86| AF[Hill-Climbing Autofocus<br/>Phase 1: Coarse scan 0-1023<br/>Phase 2: Binary search refinement]
+    AutofocusCheck -->|No/RPi| SignalDetect
+    AF --> LockFocus[Lock Focus Position<br/>Disable HW autofocus 3x<br/>Verify locked]
+    LockFocus --> SignalDetect
+
+    SignalDetect[Signal Detection Phase<br/>Adaptive Baseline]
+    SignalDetect --> Baseline[Establish Baseline<br/>Median of 10 frames]
+    Baseline --> Scan[Scan for LED Signal]
+
+    Scan --> ScanLoop{For Each<br/>Frame}
+    ScanLoop --> CalcDiff[Calculate diff = |frame - baseline|]
+    CalcDiff --> TrackMax[Track max_diff and max_brightness]
+    TrackMax --> Combined[combined_score = diff × brightness / 255]
+    Combined --> AdaptBase[Slowly adapt baseline α=0.1]
+    AdaptBase --> CheckScore{combined_score<br/>> threshold?}
+
+    CheckScore -->|No| ScanLoop
+    CheckScore -->|Yes| DetectedLED[LED Detected at x,y]
+    DetectedLED --> ROILock[Lock ROI using Blob Analysis<br/>Measure blob dimensions<br/>Set ROI = 1.1× blob size 24-96px]
+    ROILock --> SaveDebug[Save debug_detection.png]
+    SaveDebug --> WaitOFF
+
+    WaitOFF[Wait for LED OFF Phase]
+    WaitOFF --> AdaptiveOFF{Adaptive OFF<br/>Mode?}
+    AdaptiveOFF -->|Yes| VarThresh[Measure 10 samples<br/>Threshold = max mean - 3×std, mean×0.7]
+    AdaptiveOFF -->|No| FixedThresh[Wait for value < 60% initial]
+    VarThresh --> OFFDetected[LED is OFF]
+    FixedThresh --> OFFDetected
+
+    OFFDetected --> CalibExposure{Adaptive<br/>Exposure?}
+    CalibExposure -->|Yes X86| AdjustExp[Calibrate Exposure<br/>Reduce if >50% saturated]
+    CalibExposure -->|No| NoiseCalib
+    AdjustExp --> NoiseCalib
+
+    NoiseCalib[Noise Floor Calibration<br/>30 samples while LED OFF]
+    NoiseCalib --> CalcNoise[avg_noise = mean samples<br/>signal_strength = ON - noise<br/>threshold = noise + signal×0.5]
+    CalcNoise --> InitHistory[Initialize noise_floor_history<br/>Rolling window of 10]
+    InitHistory --> Monitor[Adaptive Monitoring Loop]
+
+    Monitor --> GetFrame[Get Frame]
+    GetFrame --> MeasureROI[Measure ROI<br/>Contrast: max-median<br/>Brightness: percentile_90]
+    MeasureROI --> CheckSat{Log<br/>Saturation?}
+    CheckSat -->|Yes| TrackSat[Track saturation %<br/>Adaptive exposure if needed]
+    CheckSat -->|No| CheckState
+    TrackSat --> CheckState
+
+    CheckState{LED<br/>State?}
+    CheckState -->|OFF| UpdateNoise[Add value to noise_floor_history<br/>Recalculate threshold<br/>threshold = noise_floor + signal×0.5]
+    CheckState -->|ON|  CheckStuck
+
+    CheckStuck{ON for<br/>> 5s?}
+    CheckStuck -->|Yes| AmbientCheck{min_value ><br/>noise + 30%?}
+    CheckStuck -->|No| Transition
+    AmbientCheck -->|Yes| RaiseThresh[Ambient light increased!<br/>Add min to history<br/>Threshold rises]
+    AmbientCheck -->|No| Transition
+    RaiseThresh --> Transition
+    UpdateNoise --> Transition
+
+    Transition{val crosses<br/>threshold?}
+    Transition -->|OFF→ON| LEDOn[LED State = ON<br/>Record ON time]
+    Transition -->|ON→OFF| PulseDetect[PULSE DETECTED!<br/>Record gap and duration]
+    Transition -->|No Change| Display
+    LEDOn --> Display
+    PulseDetect --> CheckAlarm
+
+    CheckAlarm{gap ><br/>interval×1.2?}
+    CheckAlarm -->|Yes| Alarm[Display ALARM]
+    CheckAlarm -->|No| Display
+    Alarm --> Display
+
+    Display[Display Status<br/>Contrast/Bright, Threshold<br/>Floor, Min/Max, dT, SAT%] --> GetFrame
+
+    style Start fill:#e1f5e1
+    style AF fill:#fff4e6
+    style LockFocus fill:#fff4e6
+    style DetectedLED fill:#e3f2fd
+    style PulseDetect fill:#f3e5f5
+    style Alarm fill:#ffebee
+    style Monitor fill:#e8f5e9
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. SIGNAL DETECTION (Adaptive Baseline + Combined Scoring) │
-├─────────────────────────────────────────────────────────────┤
-│ • Establish baseline (median of 10 frames)                  │
-│ • Track max_diff and max_brightness over time               │
-│ • Combined score = (diff × brightness) / 255                │
-│ • Baseline adapts slowly (α=0.1) to handle drift            │
-│ • ROI auto-sized using blob analysis (24-96 pixels)         │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 2. INITIAL CALIBRATION (OFF State)                          │
-├─────────────────────────────────────────────────────────────┤
-│ • Wait for LED to turn OFF (variance-based detection)       │
-│ • Measure noise floor (30 samples)                          │
-│ • Calculate: threshold = noise + (signal_strength × 0.5)    │
-│ • Initialize noise_floor_history (rolling window)           │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 3. ADAPTIVE MONITORING (Bidirectional Threshold Adjust)     │
-├─────────────────────────────────────────────────────────────┤
-│ WHEN LED IS OFF:                                            │
-│   • Add current value → noise_floor_history                 │
-│   • Recalculate: noise_floor = mean(last 10 samples)        │
-│   • Update: threshold = noise_floor + (signal × 0.5)        │
-│                                                              │
-│ WHEN LED IS STUCK ON (>5 seconds):                          │
-│   • Track minimum value during ON state                     │
-│   • If min > noise_floor + 30% signal:                      │
-│       → Ambient light increased!                            │
-│       → Add min to noise_floor_history                      │
-│       → Threshold rises automatically                       │
-│                                                              │
-│ PULSE DETECTION:                                            │
-│   • State-based: Record transition ON → OFF (falling edge)  │
-│   • Gap timing: Time since last OFF transition              │
-│   • Alarm: gap > interval × 1.2                             │
-└─────────────────────────────────────────────────────────────┘
-```
+
+### Algorithm Phase Summary
+
+**Phase 0: Camera Initialization**
+- Set manual exposure (8.3ms) at 60fps
+- Disable hardware autofocus
+- Optional: 5s aiming phase with preview
+
+**Phase 0b: Autofocus (X86 Only)**
+- Hill-climbing algorithm with coarse scan + binary search
+- Finds optimal focus position (0-1023)
+- Locks focus by disabling HW autofocus 3 times
+
+**Phase 1: Signal Detection**
+- Adaptive baseline tracks environment
+- Combined scoring: (brightness × change) / 255
+- Blob analysis determines ROI size (24-96 pixels)
+
+**Phase 2: Wait for LED OFF**
+- Variance-based (adaptive) or fixed threshold
+- Confirms LED can turn off
+
+**Phase 2b: Exposure Calibration**
+- Reduces exposure if >50% frames saturated
+
+**Phase 3: Noise Floor Calibration**
+- 30 samples while LED is OFF
+- Calculates initial threshold = noise + signal × 0.5
+
+**Phase 4: Adaptive Monitoring**
+- **When LED is OFF**: Updates noise floor from current readings
+- **When LED stuck ON >5s**: Detects ambient light increase
+- **Pulse Detection**: Records ON→OFF transitions (falling edge)
+- **Bidirectional Threshold**: Adapts to both brighter and dimmer environments
 
 ---
 

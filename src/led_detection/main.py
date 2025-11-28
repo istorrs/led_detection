@@ -180,7 +180,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                  adaptive_off=True,      # 1c: Adaptive OFF detection
                  log_saturation=True,    # 2a: Saturation logging
                  adaptive_exposure=True, # 2b: Adaptive exposure (experimental)
-                 autofocus=False,        # 2c: Autofocus sweep (experimental)
+                 autofocus=True,         # 2c: Autofocus sweep
                  min_pulse_duration=100, # 3a: Minimum pulse duration (ms)
                  window_name="Detection Monitor" # 4a: Custom window name
                 ):
@@ -350,6 +350,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     cv2.imshow(self.window_name, vis_frame)
                     cv2.waitKey(1000) # Pause to let user see the ROI
+                    # Close this window - main monitoring will open fresh window
+                    cv2.destroyWindow(self.window_name)
+                    cv2.waitKey(1)  # Process close event
 
                 return True
 
@@ -637,10 +640,27 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
         # Keep preview window open for 2 seconds to show final result
         logging.info("Autofocus complete.")
+
+        # Explicitly disable camera autofocus and lock focus position
+        # Some cameras need this done repeatedly to stick
+        logging.info("Locking focus at position %d...", best_focus)
+        for _ in range(3):
+            self.cam.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            time.sleep(0.05)
+            self.cam.cap.set(cv2.CAP_PROP_FOCUS, best_focus)
+            time.sleep(0.05)
+
+        # Verify focus is locked
+        actual_focus = int(self.cam.cap.get(cv2.CAP_PROP_FOCUS))
+        actual_autofocus = int(self.cam.cap.get(cv2.CAP_PROP_AUTOFOCUS))
+        logging.info("Focus locked: position=%d, hw_autofocus=%s",
+                     actual_focus, "DISABLED" if actual_autofocus == 0 else "ENABLED")
+
         if self.preview:
             logging.info("Showing final result for 2 seconds...")
             time.sleep(2.0)
             cv2.destroyWindow("Autofocus Sweep")
+            cv2.waitKey(1)  # Process window close event
 
     def wait_for_led_off(self):
         """ Monitors ROI brightness until it drops significanty """
@@ -1057,15 +1077,15 @@ def main():
         description="LED Detection and Monitoring System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Feature Flags (all enabled by default except adaptive-exposure and autofocus):
+Feature Flags (all enabled by default except adaptive-exposure):
   --use-contrast        Use contrast (max-median) instead of brightness
   --adaptive-roi        Automatically size ROI based on LED blob size
   --adaptive-off        Use variance-based OFF detection
   --log-saturation      Track and log saturation events
   --adaptive-exposure   Automatically adjust camera exposure (experimental)
-  --autofocus           Automatically find optimal focus (experimental, X86 only)
+  --autofocus           Automatically find optimal focus (X86 only)
 
-To disable a feature, use --no-<feature>, e.g., --no-use-contrast
+To disable a feature, use --no-<feature>, e.g., --no-autofocus
         """)
 
     parser.add_argument("-i", "--interval", type=float, default=60.0,
@@ -1104,8 +1124,10 @@ To disable a feature, use --no-<feature>, e.g., --no-use-contrast
                        help="Auto-adjust exposure (experimental, X86 only)")
 
     parser.add_argument("--autofocus", dest="autofocus",
-                       action="store_true", default=False,
-                       help="Auto-focus using Laplacian variance sweep (experimental, X86 only)")
+                       action="store_true", default=True,
+                       help="Auto-focus using Laplacian variance sweep (default, X86 only)")
+    parser.add_argument("--no-autofocus", dest="autofocus", action="store_false",
+                       help="Disable autofocus")
 
     parser.add_argument("--min-pulse-duration", dest="min_pulse_duration",
                        type=int, default=25,
