@@ -411,7 +411,7 @@ flowchart TD
     Baseline --> Scan[Scan for LED Signal]
 
     Scan --> ScanLoop{For Each<br/>Frame}
-    ScanLoop --> CalcDiff[Calculate diff = |frame - baseline|]
+    ScanLoop --> CalcDiff["Calculate diff = abs(frame - baseline)"]
     CalcDiff --> TrackMax[Track max_diff and max_brightness]
     TrackMax --> Combined[combined_score = diff × brightness / 255]
     Combined --> AdaptBase[Slowly adapt baseline α=0.1]
