@@ -1,13 +1,13 @@
-"""Integration tests for LED pulse detection with real hardware."""
-
 import os
 import time
 import logging
-
+import shutil
 import pytest
+import cv2
+import numpy as np
 
 from tests.integration.led_controller import LEDController
-
+from led_detection.main import PeakMonitor
 
 # Generate test matrix with brightness scaling based on pulse duration
 # Full brightness testing only for fastest pulses (50-100ms)
@@ -60,6 +60,18 @@ for duration in LONG_DURATIONS:
                 TEST_CASES.append((duration, period, brightness))
 
 
+@pytest.fixture(scope="module", autouse=True)
+def clean_debug_dir():
+    """Clean debug directory before test run."""
+    debug_dir = "/tmp/led_pulse"
+    if os.path.exists(debug_dir):
+        shutil.rmtree(debug_dir)
+    os.makedirs(debug_dir)
+    logging.info("Cleaned debug directory: %s", debug_dir)
+    yield
+    # No cleanup after, so user can inspect
+
+
 @pytest.fixture(scope="module")
 def led_controller():
     """Provide LED controller with automatic cleanup."""
@@ -69,15 +81,67 @@ def led_controller():
 
     yield controller
 
-    controller.stop_pulse()
+    # Leave LED pulsing: 100ms ON every 500ms at 100% brightness
+    controller.set_pulse(100, 500, 100)
+    time.sleep(0.1)
+
     controller.disconnect()
 
+
+@pytest.fixture(scope="module")
+def monitor():
+    """Provide PeakMonitor with shared camera."""
+    try:
+        # Check if we should show preview
+        show_preview = os.getenv('INTEGRATION_PREVIEW', '0') == '1'
+
+        mon = PeakMonitor(
+            interval=10,
+            threshold=20,
+            preview=show_preview,
+            adaptive_roi=True,
+            adaptive_off=True,
+            autofocus=True,
+            window_name="Integration Test"
+        )
+
+        logging.info("Initializing camera...")
+        mon.cam.start()
+
+        if mon.autofocus:
+            logging.info("Running initial autofocus...")
+            mon.autofocus_sweep()
+
+        yield mon
+
+        mon.cam.stop()
+        if show_preview:
+            cv2.destroyAllWindows()
+
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Failed to initialize monitor/camera: %s", e)
+        pytest.skip(f"Camera not available: {e}")
+
+
+
+# Shared results storage
+ROI_RESULTS = {
+    "centers": [],
+    "valid_iterations": 0
+}
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_roi_collection():
+    """Initialize ROI collection."""
+    ROI_RESULTS["centers"] = []
+    ROI_RESULTS["valid_iterations"] = 0
+    yield
 
 @pytest.mark.integration
 @pytest.mark.parametrize("duration_ms,period_ms,brightness_pct", TEST_CASES)
 def test_pulse_detection(
-    led_controller, duration_ms, period_ms, brightness_pct
-):  # pylint: disable=redefined-outer-name
+    led_controller, monitor, duration_ms, period_ms, brightness_pct
+):  # pylint: disable=redefined-outer-name, too-many-locals
     """
     Test LED pulse detection with real hardware.
 
@@ -87,75 +151,117 @@ def test_pulse_detection(
     success = led_controller.set_pulse(duration_ms, period_ms, brightness_pct)
     assert success, f"Failed to set pulse {duration_ms}ms/{period_ms}ms/{brightness_pct}%"
 
-    # Allow pulses to stabilize
-    time.sleep(max(period_ms / 1000.0, 1.0))
-
+    # Immediate detection start - no stabilization needed
     logging.info(
         "Testing: dur=%dms, period=%dms, bright=%d%%",
         duration_ms, period_ms, brightness_pct
     )
 
-    # Create monitor with preview to visualize detection
-    show_preview = os.getenv('INTEGRATION_PREVIEW', '0') == '1'
+    # Reset monitor state for new test
+    monitor.roi = None
 
-    if show_preview:
-        try:
-            # pylint: disable=import-outside-toplevel
-            from led_detection.main import PeakMonitor
-            import cv2
+    # Run detection
+    # Use a timeout relative to the period, but at least 5s (or 10s for long periods)
+    timeout = max(10.0, period_ms / 1000.0 * 3)
 
-            monitor = PeakMonitor(
-                interval=10,
-                threshold=20,
-                preview=True,
-                adaptive_roi=True,
-                adaptive_off=True,
-                autofocus=True,  # Use our autofocus algorithm
-                window_name=(
-                    f"Integration Test: {duration_ms}ms/{period_ms}ms/"
-                    f"{brightness_pct}%"
-                )
-            )
+    # Calculate dwell time:
+    # For short pulses, we must dwell less than the pulse duration to capture it.
+    # For long pulses/noise robustness, we want to dwell longer (up to 2.0s).
+    # Use 50% of duration, capped at 2.0s.
+    dwell_time = min(2.0, duration_ms / 1000.0 * 0.5)
 
-            # Initialize camera EXACTLY as in normal operation (run() method)
-            # This is critical - cam.start() must be called before autofocus!
-            logging.info("Initializing camera...")
-            monitor.cam.start()
+    found = monitor.wait_for_signal(timeout=timeout, dwell_time=dwell_time)
 
-            # Run autofocus to eliminate camera autofocus breathing
-            # This mimics the exact flow in monitor.run()
-            if monitor.autofocus:
-                logging.info("Running autofocus...")
-                monitor.autofocus_sweep()
+    if found:
+        # Collect ROI stats
+        y1, y2, x1, x2 = monitor.roi
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        ROI_RESULTS["centers"].append((cx, cy))
+        ROI_RESULTS["valid_iterations"] += 1
 
-            # Show preview for a few pulse cycles using simple frame display
-            logging.info("Showing preview for ~3 cycles...")
-            preview_duration = max(period_ms / 1000.0 * 3, 5.0)
-            start_preview = time.time()
+        # Save debug image
+        debug_filename = f"detect_{duration_ms}ms_{period_ms}ms_{brightness_pct}pct.png"
+        dest_path = os.path.join("/tmp/led_pulse", debug_filename)
 
-            while (time.time() - start_preview) < preview_duration:
-                frame = monitor.cam.get_frame()
-                if frame is not None and show_preview:
-                    # Simple display without full monitoring loop
-                    cv2.imshow(monitor.window_name, frame)
-                    key = cv2.waitKey(100)
-                    if key == ord('q'):
-                        break
+        if os.path.exists("debug_detection.png"):
+            shutil.copy("debug_detection.png", dest_path)
+            logging.info("Saved debug image to %s", dest_path)
+        else:
+            logging.warning("debug_detection.png not found!")
 
-            # Clean up window
-            cv2.destroyWindow(monitor.window_name)
-            cv2.waitKey(1)  # Process window close event
+        # Verify Pulse Reporting Logic
+        # We want to detect at least 3 pulses to verify gap and duration
+        collected_pulses = []
+        def pulse_callback(_timestamp, duration, gap):
+            logging.info("Callback: duration=%.0fms, gap=%.1fs", duration, gap)
+            collected_pulses.append({'duration': duration, 'gap': gap})
 
-        except (ImportError, RuntimeError) as e:
-            logging.warning("Monitor preview failed: %s", e)
+        logging.info("Starting monitoring for 3 pulses...")
+        monitor.wait_for_led_off()
+        monitor.start_monitoring(max_pulses=3, on_pulse_callback=pulse_callback)
 
-    # Verify command succeeded
+        assert len(collected_pulses) == 3, f"Expected 3 pulses, got {len(collected_pulses)}"
+
+        # Verify durations and gaps
+        # Allow 20% tolerance or 100ms, whichever is larger
+        dur_tol = max(100, duration_ms * 0.2)
+        gap_tol = max(100, (period_ms - duration_ms) / 1000.0 * 0.2) # Gap is in seconds
+
+        for i, p in enumerate(collected_pulses):
+            # Duration check
+            assert abs(p['duration'] - duration_ms) < dur_tol, \
+                f"Pulse {i}: Duration {p['duration']}ms not within {dur_tol}ms of {duration_ms}ms"
+
+            # Gap check (skip first pulse as gap might be irregular from startup)
+            if i > 0:
+                expected_gap = (period_ms - duration_ms) / 1000.0
+                assert abs(p['gap'] - expected_gap) < gap_tol, \
+                    f"Pulse {i}: Gap {p['gap']}s not within {gap_tol}s of {expected_gap}s"
+
+    else:
+        logging.warning("Signal NOT detected for %dms/%dms/%d%%",
+                       duration_ms, period_ms, brightness_pct)
+        pytest.fail(f"Signal not detected for {duration_ms}ms pulse")
+
+    logging.info("Test completed: %dms/%dms/%d%% - Found: %s",
+                 duration_ms, period_ms, brightness_pct, found)
     assert success, "Pulse command should succeed"
 
     logging.info(
-        "Test completed: %dms/%dms/%d%% - Command successful",
-        duration_ms, period_ms, brightness_pct
+        "Test completed: %dms/%dms/%d%% - Found: %s",
+        duration_ms, period_ms, brightness_pct, found
     )
+
+@pytest.mark.integration
+def test_pulse_roi_analysis():
+    """Analyze ROI consistency across all pulse detection tests."""
+    valid_count = ROI_RESULTS["valid_iterations"]
+    centers = np.array(ROI_RESULTS["centers"])
+
+    logging.info("ROI Analysis: %d valid detections", valid_count)
+
+    if valid_count < 5:
+        # If we didn't detect enough pulses, we can't really analyze consistency.
+        # But we shouldn't fail if the tests were just skipped or failed for other reasons?
+        # The user wants to know if ROI is consistent when it IS detected.
+        if valid_count == 0:
+            pytest.skip("No valid detections to analyze.")
+        else:
+            logging.warning("Low number of detections (%d) for analysis.", valid_count)
+
+    if valid_count > 1:
+        mean_center = np.mean(centers, axis=0)
+        std_dev = np.std(centers, axis=0)
+
+        logging.info("Mean Center: %s", mean_center)
+        logging.info("Std Dev: %s", std_dev)
+
+        # Assert consistency
+        # Since we are testing different brightnesses/durations, the ROI might shift slightly
+        # due to blooming or different effective center of brightness.
+        # So we allow a larger margin than the consistency test (which repeats the exact same condition).
+        assert np.max(std_dev) < 10.0, f"ROI detection inconsistent across pulse tests! Std Dev: {std_dev}"
 
 
 @pytest.mark.integration

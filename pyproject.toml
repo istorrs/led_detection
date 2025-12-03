@@ -34,6 +34,10 @@ python_files = ["test_*.py"]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
 ]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d %(message)s"
+log_cli_date_format = "%H:%M:%S"
 
 [tool.pylint.main]
 extension-pkg-allow-list = ["cv2"]

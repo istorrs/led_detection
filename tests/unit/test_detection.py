@@ -218,13 +218,13 @@ class TestDetection(unittest.TestCase):
         # We can rely on the fact that our mock driver advances frames.
         # If we set the flash early enough, it should catch it.
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect standard flash")
 
     def test_short_flash(self):
         """Test a very short flash (1 frame)."""
         self.driver.configure_flash(start_frame=15, duration=1, brightness=150)
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect 1-frame flash")
 
     def test_low_contrast(self):
@@ -237,7 +237,7 @@ class TestDetection(unittest.TestCase):
         # Default is contrast=True.
         # 180 (spot) - 150 (median) = 30 > 20 (threshold) -> Should detect.
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect low contrast flash")
 
     def test_no_flash(self):
@@ -266,7 +266,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 220  # Very bright background
         self.driver.configure_flash(start_frame=15, duration=5, brightness=35)  # Challenging but detectable
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED even on white background")
 
     def test_black_background(self):
@@ -274,7 +274,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 10  # Very dark background
         self.driver.configure_flash(start_frame=15, duration=5, brightness=200)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED on black background")
 
     def test_gray_background(self):
@@ -282,7 +282,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 128  # Medium gray
         self.driver.configure_flash(start_frame=15, duration=5, brightness=100)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED on gray background")
 
     def test_roi_detection(self):
@@ -291,7 +291,7 @@ class TestDetection(unittest.TestCase):
         self.driver.led_position = (200, 150)
         self.driver.configure_flash(start_frame=15, duration=5, brightness=150)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED")
 
         # Verify ROI was set
@@ -330,7 +330,7 @@ class TestDetection(unittest.TestCase):
         # Flash occurs during the transition
         self.driver.configure_flash(start_frame=20, duration=5, brightness=50)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED during dark-to-bright transition")
 
     def test_bright_to_dark_transition(self):
@@ -345,7 +345,7 @@ class TestDetection(unittest.TestCase):
         # Flash occurs during the transition
         self.driver.configure_flash(start_frame=20, duration=5, brightness=100)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED during bright-to-dark transition")
 
     def test_flash_detection_rate(self):
@@ -369,7 +369,7 @@ class TestDetection(unittest.TestCase):
             # monitor.cam = self.driver # Handled by patch
             # monitor.preview = False # Enable preview
 
-            found = monitor.wait_for_signal()
+            found = monitor.wait_for_signal(dwell_time=0.0)
             if found:
                 success_count += 1
 
@@ -383,7 +383,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 2  # Near-black nighttime
         self.driver.configure_flash(start_frame=15, duration=5, brightness=100)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED in nighttime conditions")
 
     def test_bright_daylight_conditions(self):
@@ -393,7 +393,7 @@ class TestDetection(unittest.TestCase):
 
         # Saturation limits contrast to 15 (255-240). Threshold 20 is too high without noise.
         self.monitor.min_signal_strength = 10
-        found = self.monitor.wait_for_signal(timeout=10.0)
+        found = self.monitor.wait_for_signal(timeout=10.0, dwell_time=0.0)
         self.assertTrue(found, "Should detect LED in bright daylight (tests adaptive threshold)")
 
     def test_tiny_led(self):
@@ -401,7 +401,7 @@ class TestDetection(unittest.TestCase):
         self.driver.led_radius = 2
         self.driver.configure_flash(start_frame=15, duration=5, brightness=200)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect tiny 2px LED")
 
     def test_large_led(self):
@@ -409,7 +409,7 @@ class TestDetection(unittest.TestCase):
         self.driver.led_radius = 8
         self.driver.configure_flash(start_frame=15, duration=5, brightness=150)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect large 8px LED")
 
     def test_dim_led_dark_background(self):
@@ -417,7 +417,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 10
         self.driver.configure_flash(start_frame=15, duration=5, brightness=100)  # Dim but detectable
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect dim LED on dark background")
 
     def test_bright_led_bright_background(self):
@@ -425,7 +425,7 @@ class TestDetection(unittest.TestCase):
         self.driver.ambient_brightness = 200
         self.driver.configure_flash(start_frame=15, duration=5, brightness=50)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect bright LED on bright background")
 
     def test_adaptive_baseline_update(self):
@@ -440,7 +440,7 @@ class TestDetection(unittest.TestCase):
         # Flash after transition
         self.driver.configure_flash(start_frame=60, duration=5, brightness=100)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect LED after baseline adapts to ambient change")
 
     def test_extreme_contrast_range(self):
@@ -464,7 +464,7 @@ class TestDetection(unittest.TestCase):
                 # monitor.cam = self.driver # Handled by patch
                 # monitor.preview = False # Enable preview
 
-                found = monitor.wait_for_signal(timeout=10.0)
+                found = monitor.wait_for_signal(timeout=10.0, dwell_time=0.0)
                 self.assertTrue(found,
                     f"Should detect in {scenario['name']} scenario "
                     f"(ambient={scenario['ambient']}, led={scenario['led']})")
@@ -481,7 +481,7 @@ class TestDetection(unittest.TestCase):
         self.driver.add_led(pos=led2_pos, radius=6)
         self.driver.configure_flash(start_frame=15, duration=5, brightness=200, led_index=1)
 
-        found = self.monitor.wait_for_signal()
+        found = self.monitor.wait_for_signal(dwell_time=0.0)
         self.assertTrue(found, "Should detect signal with multiple LEDs")
 
         # Verify ROI selected the brighter LED (LED 2)
@@ -512,7 +512,7 @@ class TestDetection(unittest.TestCase):
                                         window_name=f"{self._testMethodName}_b{brightness}_r{radius}")
                     # monitor.cam = self.driver # Handled by patch
 
-                    found = monitor.wait_for_signal()
+                    found = monitor.wait_for_signal(dwell_time=0.0)
                     self.assertTrue(found, f"Should detect LED (bright={brightness}, rad={radius}) despite high noise")
 
     def test_static_random_background(self):
@@ -534,7 +534,7 @@ class TestDetection(unittest.TestCase):
                                         window_name=f"{self._testMethodName}_b{brightness}_r{radius}")
                     # monitor.cam = self.driver # Handled by patch
 
-                    found = monitor.wait_for_signal()
+                    found = monitor.wait_for_signal(dwell_time=0.0)
                     self.assertTrue(found, f"Should detect LED (bright={brightness}, rad={radius}) against static random background")
 
 class TestFeatures(unittest.TestCase):
@@ -575,7 +575,7 @@ class TestFeatures(unittest.TestCase):
         # 1. Adaptive ROI Enabled
         monitor = PeakMonitor(interval=10, threshold=20, adaptive_roi=True, preview=False)
         # monitor.cam = self.driver # Handled by patch
-        monitor.wait_for_signal()
+        monitor.wait_for_signal(dwell_time=0.0)
 
         y1, y2, x1, x2 = monitor.roi
         w, h = x2-x1, y2-y1
@@ -587,7 +587,7 @@ class TestFeatures(unittest.TestCase):
         self.driver.configure_flash(start_frame=15, duration=5, brightness=200)
         monitor = PeakMonitor(interval=10, threshold=20, adaptive_roi=False, preview=False)
         # monitor.cam = self.driver # Handled by patch
-        monitor.wait_for_signal()
+        monitor.wait_for_signal(dwell_time=0.0)
 
         y1, y2, x1, x2 = monitor.roi
         w, h = x2-x1, y2-y1

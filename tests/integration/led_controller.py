@@ -61,13 +61,16 @@ class LEDController:
             return None
 
         try:
+            # Clear input buffer to remove any stale data from previous commands
+            self.serial.reset_input_buffer()
+
             self.serial.write(f"{command}\n".encode())
             self.serial.flush()
 
             # Read until we see the prompt again, indicating command completion
             # ESP32 CLI format: "ESP32 CLI> "
             response_lines = []
-            timeout = time.time() + 2.0  # Maximum 2 second timeout
+            timeout = time.time() + 5.0  # Maximum 2 second timeout
 
             while time.time() < timeout:
                 if self.serial.in_waiting:
