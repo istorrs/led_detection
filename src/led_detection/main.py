@@ -25,7 +25,7 @@ def setup_logging(debug_mode):
     """Set up logging configuration."""
     level = logging.DEBUG if debug_mode else logging.INFO
     logging.basicConfig(level=level,
-                        format='[%(asctime)s.%(msecs)03d] [%(levelname)s] %(message)s',
+                        format='[%(asctime)s.%(msecs)03d] [%(levelname)s] %(filename)s:%(lineno)d %(message)s',
                         datefmt='%H:%M:%S')
 
 # --- DRIVERS ---
@@ -94,7 +94,6 @@ class X86CameraDriver(CameraDriver):
 
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self.cap.set(cv2.CAP_PROP_GAIN, 0)
-        time.sleep(5)
 
         # Get current focus and set it explicitly to ensure manual mode is active
         # Some cameras need an actual focus value set to leave autofocus mode
@@ -222,6 +221,11 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.last_exposure_adjust = 0  # Time of last exposure adjustment
         self.noise_floor_skip_count = 0  # Track how many updates we've skipped
 
+        # Initialized later
+        self.thresh_high = 0.0
+        self.thresh_low = 0.0
+        self.frame_interval = 0.033
+
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
         if self.use_contrast:
@@ -245,10 +249,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         cv2.destroyWindow("Aiming")
 
 
-    def wait_for_signal(self, timeout=None):
-        """Detects the LED signal by looking for bright AND changing pixels."""
-        # pylint: disable=too-many-locals
-        # 1. Establish baseline
+    def _establish_baseline(self):
+        """Capture baseline frames for signal detection."""
         logging.info("Establishing baseline...")
         baseline_frames = []
         for _ in range(10):
@@ -261,9 +263,27 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             time.sleep(0.05)
 
         if not baseline_frames:
+            logging.error("Failed to capture baseline frames.")
+            return None
+
+        return np.median(baseline_frames, axis=0).astype(np.uint8)
+
+    def wait_for_signal(self, timeout=None, dwell_time=2.0):
+        """
+        Wait for a signal to be detected.
+
+        Args:
+            timeout: Maximum time to wait in seconds.
+            dwell_time: Time the signal must be sustained to be considered valid (seconds).
+        """
+        # pylint: disable=too-many-locals, too-many-nested-blocks
+        if not self.cam.cap.isOpened():
             return False
 
-        baseline = np.median(baseline_frames, axis=0).astype(np.uint8)
+        # 1. Establish baseline
+        baseline = self._establish_baseline()
+        if baseline is None:
+            return False
 
         # 2. Scan for signal
         accum_max_diff = np.zeros_like(baseline)
@@ -271,6 +291,14 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
         start_scan = time.time()
         scan_duration = timeout if timeout is not None else self.scan_timeout
+
+        detection_start_time = None
+        # DWELL_TIME is now a parameter
+
+        if self.preview:
+            logging.info("Preview enabled. Window name: %s", self.window_name)
+            cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+
         while time.time() - start_scan < scan_duration:
             frame = self.cam.get_frame()
             if frame is None:
@@ -321,40 +349,93 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 if max_val > 0:
                     cv2.circle(vis_frame, max_loc, 10, status_color, 2)
 
+                # Draw ROI if we were to lock now
+                if max_val > self.min_signal_strength:
+                    cv2.circle(vis_frame, max_loc, 20, (0, 255, 255), 2)
+                    if detection_start_time:
+                        remaining = dwell_time - (time.time() - detection_start_time)
+                        cv2.putText(vis_frame, f"Verifying... {remaining:.1f}s", (10, 60),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
                 cv2.imshow(self.window_name, vis_frame)
                 cv2.waitKey(1)
 
             if max_val > self.min_signal_strength:
-                # Wait a bit more to ensure we capture the full pulse
-                time.sleep(0.5)
-                logging.info("SIGNAL DETECTED! Score: %d", max_val)
+                # Verify blob size to reject single-pixel noise
+                # Threshold relative to peak to isolate the potential blob
+                threshold_val = max(self.min_signal_strength * 0.5, max_val * 0.8)
+                _, binary = cv2.threshold(accum_max_diff, threshold_val, 255, cv2.THRESH_BINARY)
+                binary = binary.astype(np.uint8)
 
-                # Lock ROI based on the COMBINED map (Bright + Changed)
-                self.lock_roi(max_loc, gray.shape, combined_map)
+                # Check connected component at max_loc using floodFill
+                # This is efficient and gives us the bounding box of the blob at max_loc
+                mask = np.zeros((accum_max_diff.shape[0]+2, accum_max_diff.shape[1]+2), np.uint8)
+                _, _, _, rect = cv2.floodFill(binary, mask, max_loc, 255)
+                blob_w, blob_h = rect[2], rect[3]
 
-                # Measure the actual ON brightness using the same method as monitoring
-                # This ensures threshold calculation matches actual measurements
-                y1, y2, x1, x2 = self.roi
-                roi = gray[y1:y2, x1:x2]
-                self.detected_on_brightness = self._measure_roi(roi)
-                self.detected_peak_strength = accum_max_diff[max_loc[1], max_loc[0]]
+                # Require at least 3x3 blob to consider it a valid signal source
+                # UNLESS the signal is very strong (e.g. focused LED at distance)
+                is_small = blob_w < 3 and blob_h < 3
+                is_strong = max_val > self.min_signal_strength * 1.5
 
-                logging.info("[Debug] Initial ROI brightness: %.1f", self.detected_on_brightness)
+                if is_small and not is_strong:
+                    # Too small and not strong enough. Likely noise.
+                    logging.debug("Ignored small blob: %dx%d at %s (Score: %d)", blob_w, blob_h, max_loc, max_val)
+                    detection_start_time = None
+                else:
+                    # Verify that the CURRENT signal is also strong, not just the accumulated history
+                    # accum_max_diff remembers past peaks, so a transient noise spike would stick.
+                    # We need to ensure the signal is SUSTAINED.
+                    current_val = diff[max_loc[1], max_loc[0]]
 
-                # Visualize ROI if preview enabled
-                if self.preview:
-                    # Re-draw frame with ROI
-                    vis_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                    cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(vis_frame, "ROI LOCKED", (x1, y1-10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    cv2.imshow(self.window_name, vis_frame)
-                    cv2.waitKey(1000) # Pause to let user see the ROI
-                    # Close this window - main monitoring will open fresh window
-                    cv2.destroyWindow(self.window_name)
-                    cv2.waitKey(1)  # Process close event
+                    # Use a relaxed threshold for sustaining (50% of trigger threshold)
+                    # This handles slight fluctuations but rejects noise that has disappeared
+                    if current_val > self.min_signal_strength * 0.5:
+                        if detection_start_time is None:
+                            detection_start_time = time.time()
+                            logging.info("Potential signal (%.1f). Current: %.1f. Verifying...", max_val, current_val)
 
-                return True
+                        # Debug logging
+                        # logging.info("Time: %.2f, Start: %s, Diff: %.2f", time.time(), detection_start_time, time.time() - (detection_start_time or 0))
+
+                        if time.time() - detection_start_time > dwell_time:
+                            logging.info("SIGNAL DETECTED! Score: %d", max_val)
+
+                            # Lock ROI based on the COMBINED map (Bright + Changed)
+                            self.lock_roi(max_loc, gray.shape, combined_map)
+
+                            # Measure the actual ON brightness using the same method as monitoring
+                            # This ensures threshold calculation matches actual measurements
+                            y1, y2, x1, x2 = self.roi
+                            roi = gray[y1:y2, x1:x2]
+                            self.detected_on_brightness = self._measure_roi(roi)
+                            self.detected_peak_strength = accum_max_diff[max_loc[1], max_loc[0]]
+
+                            logging.info("[Debug] Peak signal strength: %.1f", self.detected_peak_strength)
+
+                            # Visualize ROI if preview enabled
+                            if self.preview:
+                                # Re-draw frame with ROI
+                                vis_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                                cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(vis_frame, "ROI LOCKED", (x1, y1-10),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                cv2.imshow(self.window_name, vis_frame)
+                                cv2.waitKey(1000) # Pause to let user see the ROI
+                                # Close this window - main monitoring will open fresh window
+                                cv2.destroyWindow(self.window_name)
+                                cv2.waitKey(1)  # Process close event
+
+                            return True
+                    else:
+                        # Signal dropped below sustaining threshold
+                        detection_start_time = None
+            else:
+                # If signal drops below threshold, should we reset?
+                # No, accum_max_diff retains the peak.
+                # But if it was just noise and we want to wait for a REAL pulse...
+                # accum_max_diff never drops. So max_val never drops.
+                detection_start_time = None # Reset if signal drops below threshold
 
             time.sleep(0.05)
 
@@ -730,29 +811,16 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         logging.warning("Timeout waiting for LED off! Noise floor might be inaccurate.")
         return False
 
-    def run(self):
-        """Run the monitor loop."""
-        # pylint: disable=too-many-locals, too-many-statements, too-many-branches
-        self.cam.start()
-        if self.preview:
-            self.aim_camera()
 
-        # 0. Autofocus (if enabled) - must happen before ROI detection
-        self.autofocus_sweep()
+    def start_monitoring(self, max_pulses=None, on_pulse_callback=None):
+        """
+        Start the monitoring loop.
 
-        # 1. Search Loop
-        print("[System] Waiting for device activity...")
-        while True:
-            if self.wait_for_signal():
-                break
-            print("\n[Retry] No signal seen. Clearing buffer and rescanning...\n")
-
-        # 2. Wait for "OFF" State
-        self.wait_for_led_off()
-
-        # 2b. Adaptive Exposure (if enabled)
-        self.calibrate_exposure()
-
+        Args:
+            max_pulses: Optional limit on number of pulses to detect before exiting.
+            on_pulse_callback: Optional callback function(timestamp, duration, gap) called on detection.
+        """
+        # pylint: disable=too-many-locals, too-many-statements, too-many-branches, too-many-nested-blocks
         # 3. Calibrate Noise Floor (OFF State)
         logging.info("Calibrating OFF-state noise floor...")
         y1, y2, x1, x2 = self.roi
@@ -765,35 +833,72 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             metric_samples.append(self._measure_roi(roi))
             bg_brightness_samples.append(np.median(roi))  # Background brightness
 
-        avg_noise_level = np.mean(metric_samples)
+        avg_noise_level = np.median(metric_samples)
+        std_noise_level = np.std(metric_samples)
+
+        # Initialize noise floor history with calibrated samples
+        # Fill the history window with the measured noise level to establish baseline
+        #logging.warning("CHANGE FOR NOISE FLOOR HISTORY")
+        self.noise_floor_history = metric_samples[:self.noise_floor_window]
+
         # Estimate ON level and Signal Strength
-        if hasattr(self, 'detected_on_brightness'):
+        # Sanity check: detected_on_brightness must be significantly above noise floor
+        # Otherwise, we likely measured the LED after it turned off
+        if (hasattr(self, 'detected_on_brightness') and
+            self.detected_on_brightness > avg_noise_level + 10.0): # Require at least 10 units above noise
             estimated_on_level = self.detected_on_brightness
+            logging.info("[Debug] Using detected_on_brightness: %.1f", estimated_on_level)
         else:
-            estimated_on_level = avg_noise_level + self.detected_peak_strength
+            if hasattr(self, 'detected_on_brightness'):
+                logging.warning("detected_on_brightness (%.1f) too close to noise (%.1f). Fallback to peak strength.",
+                              self.detected_on_brightness, avg_noise_level)
+
+            logging.info("[Debug] Using detected_peak_strength: %.1f", self.detected_peak_strength)
+            estimated_on_level = min(255.0, avg_noise_level + self.detected_peak_strength)
+
 
         self.calibrated_signal_strength = max(10.0, estimated_on_level - avg_noise_level)
         self.current_noise_floor = avg_noise_level
 
-        # Set threshold: Noise + 50% of Signal
-        self.thresh_bright = self.current_noise_floor + (self.calibrated_signal_strength * 0.5)
+        # Set thresholds for Hysteresis
+        # High threshold to START detection (reject noise)
+        # Low threshold to CONTINUE detection (capture tails)
+
+        # High: Max of (Noise + 50% Signal) AND (Noise + 3 * StdDev)
+        high_signal_margin = self.calibrated_signal_strength * 0.5
+        high_noise_margin = 3.0 * std_noise_level
+        self.thresh_high = self.current_noise_floor + max(high_signal_margin, high_noise_margin)
+
+        # Low: Max of (Noise + 20% Signal) AND (Noise + 1 * StdDev)
+        low_signal_margin = self.calibrated_signal_strength * 0.2
+        low_noise_margin = 1.0 * std_noise_level
+        self.thresh_low = self.current_noise_floor + max(low_signal_margin, low_noise_margin)
 
         metric_name = "Contrast" if self.use_contrast else "Brightness"
-        logging.info("Noise (%s): %.1f | Est. ON: %.1f | Signal: %.1f",
-                    metric_name, avg_noise_level, estimated_on_level,
+        logging.info("Noise (%s): %.1f (Std: %.1f) | Est. ON: %.1f | Signal: %.1f",
+                    metric_name, avg_noise_level, std_noise_level, estimated_on_level,
                     self.calibrated_signal_strength)
-        logging.info("Set Initial Detection Threshold: %.1f", self.thresh_bright)
+        logging.info("Thresholds: High=%.1f (Start), Low=%.1f (Continue)",
+                     self.thresh_high, self.thresh_low)
 
         # Saturation check
         if self.log_saturation and np.mean(bg_brightness_samples) > 240: # Use mean of samples
             logging.warning("High ambient brightness detected! Sensor may be saturating.")
 
+        start_time = time.time()
+        pulses_found = 0
+        last_pulse = start_time
+
         # --- Monitoring Loop ---
         logging.info("--- MONITORING STARTED ---")
 
-        last_pulse = time.time()
         self.led_state = False  # Reset LED state
-        last_off_time = last_pulse  # Track last time LED was truly OFF
+        last_active_time = last_pulse # Track last time signal was above threshold
+
+        # Estimate frame interval for duration correction
+        # We can use the interval between the last few frames if available, or default to 33ms
+        self.frame_interval = 0.033 # Default to 30fps
+        last_frame_time = time.time()
 
         # Stats aggregation
         report_period = 1.0
@@ -804,11 +909,24 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         t_max = last_pulse
         t_min = last_pulse
 
+        pulse_count = 0
+
         while True:  # pylint: disable=too-many-nested-blocks
+            if max_pulses is not None and pulses_found >= max_pulses:
+                logging.info("Reached max pulses (%d). Exiting.", max_pulses)
+                break
             # Capture frame
             frame = self.cam.get_frame() # Changed from read_frame() to get_frame()
             if frame is None:
                 break
+
+            now = time.time()
+            # Update frame interval estimate
+            current_interval = now - last_frame_time
+            if 0.001 < current_interval < 0.2: # Filter reasonable values
+                # Simple moving average
+                self.frame_interval = (self.frame_interval * 0.9) + (current_interval * 0.1)
+            last_frame_time = now
 
             # Process ROI
             if self.roi:
@@ -819,6 +937,11 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
             # Measure signal
             val = self._measure_roi(roi) # Changed from get_signal_strength() to _measure_roi()
+
+            # Calculate ROI stats for exposure logic
+            roi_median = np.median(roi)
+            roi_p95 = np.percentile(roi, 95)
+
             now = time.time()
 
             # Saturation tracking and continuous adaptive exposure
@@ -842,7 +965,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                         current_exposure = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
 
                         # Check if we need to reduce exposure (too saturated)
-                        if recent_sat_pct > 0.5:
+                        # Only if the image is also reasonably bright (median > 100)
+                        if recent_sat_pct > 0.5 and roi_median > 100:
                             # More than 50% of recent frames saturated - reduce exposure
                             new_exposure = current_exposure * 0.7
                             self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
@@ -854,7 +978,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
                         # Check for high ambient light via skip counter
                         # Only trigger if we're repeatedly hitting the noise floor cap
-                        elif self.noise_floor_skip_count > 100:  # Cap hit >100 times
+                        # AND the image is actually bright (median > 100)
+                        # This prevents reducing exposure when we have high contrast but dark image (e.g. floor=0)
+                        elif self.noise_floor_skip_count > 100 and roi_median > 100:  # Cap hit >100 times
                             # Ambient light has increased significantly
                             new_exposure = current_exposure * 0.7
                             self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
@@ -896,6 +1022,12 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                                 should_increase = True
                                 reason = f"Low ambient (floor={self.current_noise_floor:.0f})"
 
+                            # Scenario 3: Image is too dark (recovery mode)
+                            # If the 95th percentile is very low, we are likely underexposed
+                            elif roi_p95 < 50.0 and current_exposure < 83.0:
+                                should_increase = True
+                                reason = f"Image too dark (p95={roi_p95:.1f})"
+
                             if should_increase:
                                 # Cap at initial exposure
                                 new_exposure = min(current_exposure * 1.3, 83.0)
@@ -914,8 +1046,18 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 int_min = val
                 t_min = now
 
+            # Reset min_while_on to current value to avoid getting stuck on a past low
+            self.min_while_on = val
+
             # Check if LED is active (must be calculated before adaptive threshold update)
-            is_active = val > self.thresh_bright
+            # Hysteresis Thresholding
+            if not self.led_state:
+                # To turn ON, must exceed HIGH threshold
+                is_active = val > self.thresh_high
+            else:
+                # To stay ON, must exceed LOW threshold
+                is_active = val > self.thresh_low
+
             gap = now - last_pulse
 
             # Adaptive Threshold Update (Bidirectional)
@@ -929,8 +1071,8 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
 
                 # Cap noise floor updates to prevent runaway threshold increases
                 # Only update if the new value is reasonable relative to calibrated baseline
-                # Increased from 30% to 60% to allow for higher ambient light
-                max_reasonable_floor = self.calibrated_signal_strength * 0.6
+                # Changed from absolute check to relative check to handle high noise floors
+                max_reasonable_floor = self.current_noise_floor + self.calibrated_signal_strength
                 if val < max_reasonable_floor or len(self.noise_floor_history) == 0:
                     self.noise_floor_history.append(val)
                     if len(self.noise_floor_history) > self.noise_floor_window:
@@ -979,7 +1121,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     self.min_while_on = min(self.min_while_on, val)
 
                 # Only update noise floor from "stuck ON" if reasonable
-                max_reasonable_floor = self.calibrated_signal_strength * 0.6
+                max_reasonable_floor = self.current_noise_floor + self.calibrated_signal_strength
 
                 # If stuck ON for > 10s, force update even if high
                 force_update = time_since_off > 10.0
@@ -1007,26 +1149,53 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     # Reset min_while_on to current value to avoid getting stuck on a past low
                     self.min_while_on = val
 
+            # Check if LED is active (must be calculated before adaptive threshold update)
+            is_active = val > self.thresh_bright
+
+            # Debounce Logic
             if is_active:
+                last_active_time = now
                 if not self.led_state:
                     # LED just turned ON
                     self.led_state = True
                     self.led_on_time = now
             else:
+                # LED is currently below threshold
                 if self.led_state:
-                    # LED just turned OFF
-                    self.led_state = False
-                    duration = (now - self.led_on_time) * 1000 # ms
+                    # Check if it has been OFF for long enough to confirm
+                    min_gap_duration = 0.1 # 100ms debounce
+                    if now - last_active_time > min_gap_duration:
+                        # Confirmed OFF
+                        self.led_state = False
+                        # Duration ends at the last known active time
+                        # Duration ends at the last known active time
+                        # Add one frame interval to account for the duration of the last frame itself
+                        duration = (last_active_time - self.led_on_time + self.frame_interval) * 1000 # ms
 
-                    # Filter out short noise spikes
-                    if duration >= self.min_pulse_duration:
-                        last_pulse = now
-                        if gap > 0.5: # Reduced from 2.0s to catch faster pulses
-                            timestamp = get_timestamp()
-                            sys.stdout.write(f"\033[96m[{timestamp}] [PULSE DETECTED] "
-                                           f"Gap: {gap:.1f}s | Duration: {duration:.0f}ms\033[0m\n")
-                    else:
-                        logging.debug("Ignored short pulse: %.0fms", duration)
+                        # Calculate gap from the END of the previous pulse to the START of this one
+                        # last_pulse tracks the END of the previous pulse
+                        gap = self.led_on_time - last_pulse
+
+                        timestamp = get_timestamp()
+                        sys.stdout.write(f"\033[91m[{timestamp}] [LED OFF] Duration: {duration:.0f}ms\033[0m\n")
+
+                        # Filter out short noise spikes
+                        if duration >= self.min_pulse_duration:
+                            last_pulse = last_active_time # Update last pulse end time
+                            if gap > 0.1: # Reduced to 0.1s to catch faster pulses
+                                timestamp = get_timestamp()
+                                sys.stdout.write(f"\033[96m[{timestamp}] [PULSE DETECTED] "
+                                               f"Gap: {gap:.1f}s | Duration: {duration:.0f}ms\033[0m\n")
+
+                                if on_pulse_callback:
+                                    on_pulse_callback(timestamp, duration, gap)
+
+                                pulse_count += 1
+                                if max_pulses and pulse_count >= max_pulses:
+                                    logging.info("Reached max pulses (%d). Exiting.", max_pulses)
+                                    return
+                        else:
+                            logging.debug("Ignored short pulse: %.0fms", duration)
 
             # Report every second
             if now - last_report > report_period:
@@ -1058,11 +1227,13 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 last_report = now
                 int_max = 0
                 int_min = 255 if not self.use_contrast else 0
+                t_max = now
+                t_min = now
                 if self.log_saturation:
                     self.saturation_count = 0
                     self.total_frames = 0
 
-            if isinstance(self.cam, X86CameraDriver):
+            if self.preview and isinstance(self.cam, X86CameraDriver):
                 debug = frame.copy()
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 1)
                 cv2.putText(debug, f"{val:.0f}", (x1, y1-5),
@@ -1071,6 +1242,32 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 cv2.imshow("Monitor", debug)
                 if cv2.waitKey(1) == ord('q'):
                     break
+
+    def run(self):
+        """Run the monitor loop."""
+        # pylint: disable=too-many-locals, too-many-statements, too-many-branches
+        self.cam.start()
+        if self.preview:
+            self.aim_camera()
+
+        # 0. Autofocus (if enabled) - must happen before ROI detection
+        self.autofocus_sweep()
+
+        # 1. Search Loop
+        print("[System] Waiting for device activity...")
+        while True:
+            if self.wait_for_signal():
+                break
+            print("\n[Retry] No signal seen. Clearing buffer and rescanning...\n")
+
+        # 2. Wait for "OFF" State
+        self.wait_for_led_off()
+
+        # 2b. Adaptive Exposure (if enabled)
+        self.calibrate_exposure()
+
+        # 3. Start Monitoring
+        self.start_monitoring()
 
 def main():
     parser = argparse.ArgumentParser(

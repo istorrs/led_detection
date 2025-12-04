@@ -411,7 +411,7 @@ flowchart TD
     Baseline --> Scan[Scan for LED Signal]
 
     Scan --> ScanLoop{For Each<br/>Frame}
-    ScanLoop --> CalcDiff[Calculate diff = |frame - baseline|]
+    ScanLoop --> CalcDiff["Calculate diff = abs(frame - baseline)"]
     CalcDiff --> TrackMax[Track max_diff and max_brightness]
     TrackMax --> Combined[combined_score = diff × brightness / 255]
     Combined --> AdaptBase[Slowly adapt baseline α=0.1]
@@ -449,7 +449,7 @@ flowchart TD
 
     CheckState{LED<br/>State?}
     CheckState -->|OFF| UpdateNoise[Add value to noise_floor_history<br/>Recalculate threshold<br/>threshold = noise_floor + signal×0.5]
-    CheckState -->|ON|  CheckStuck
+    CheckState -->|ON| CheckStuck
 
     CheckStuck{ON for<br/>> 5s?}
     CheckStuck -->|Yes| AmbientCheck{min_value ><br/>noise + 30%?}
