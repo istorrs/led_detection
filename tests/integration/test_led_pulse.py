@@ -93,15 +93,16 @@ def monitor():
     """Provide PeakMonitor with shared camera."""
     try:
         # Check if we should show preview
-        show_preview = os.getenv('INTEGRATION_PREVIEW', '0') == '1'
+        show_preview = os.getenv('INTEGRATION_PREVIEW', '1') == '1'
 
         mon = PeakMonitor(
             interval=10,
-            threshold=20,
+            threshold=50,
             preview=show_preview,
             adaptive_roi=True,
             adaptive_off=True,
             autofocus=True,
+            min_pulse_duration=25,
             window_name="Integration Test"
         )
 
@@ -207,6 +208,8 @@ def test_pulse_detection(
         # Allow 20% tolerance or 100ms, whichever is larger
         dur_tol = max(100, duration_ms * 0.2)
         gap_tol = max(100, (period_ms - duration_ms) / 1000.0 * 0.2) # Gap is in seconds
+
+        logging.info("Collected Pulses: %s", collected_pulses)
 
         for i, p in enumerate(collected_pulses):
             # Duration check

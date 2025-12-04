@@ -221,6 +221,11 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.last_exposure_adjust = 0  # Time of last exposure adjustment
         self.noise_floor_skip_count = 0  # Track how many updates we've skipped
 
+        # Initialized later
+        self.thresh_high = 0.0
+        self.thresh_low = 0.0
+        self.frame_interval = 0.033
+
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
         if self.use_contrast:
@@ -829,6 +834,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             bg_brightness_samples.append(np.median(roi))  # Background brightness
 
         avg_noise_level = np.median(metric_samples)
+        std_noise_level = np.std(metric_samples)
 
         # Initialize noise floor history with calibrated samples
         # Fill the history window with the measured noise level to establish baseline
@@ -836,36 +842,63 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.noise_floor_history = metric_samples[:self.noise_floor_window]
 
         # Estimate ON level and Signal Strength
-        if hasattr(self, 'detected_on_brightness') and self.detected_on_brightness > 0:
+        # Sanity check: detected_on_brightness must be significantly above noise floor
+        # Otherwise, we likely measured the LED after it turned off
+        if (hasattr(self, 'detected_on_brightness') and
+            self.detected_on_brightness > avg_noise_level + 10.0): # Require at least 10 units above noise
             estimated_on_level = self.detected_on_brightness
             logging.info("[Debug] Using detected_on_brightness: %.1f", estimated_on_level)
         else:
+            if hasattr(self, 'detected_on_brightness'):
+                logging.warning("detected_on_brightness (%.1f) too close to noise (%.1f). Fallback to peak strength.",
+                              self.detected_on_brightness, avg_noise_level)
+
             logging.info("[Debug] Using detected_peak_strength: %.1f", self.detected_peak_strength)
-            estimated_on_level = avg_noise_level + self.detected_peak_strength
+            estimated_on_level = min(255.0, avg_noise_level + self.detected_peak_strength)
+
 
         self.calibrated_signal_strength = max(10.0, estimated_on_level - avg_noise_level)
         self.current_noise_floor = avg_noise_level
 
-        # Set threshold: Noise + 50% of Signal
-        self.thresh_bright = self.current_noise_floor + (self.calibrated_signal_strength * 0.5)
+        # Set thresholds for Hysteresis
+        # High threshold to START detection (reject noise)
+        # Low threshold to CONTINUE detection (capture tails)
+
+        # High: Max of (Noise + 50% Signal) AND (Noise + 3 * StdDev)
+        high_signal_margin = self.calibrated_signal_strength * 0.5
+        high_noise_margin = 3.0 * std_noise_level
+        self.thresh_high = self.current_noise_floor + max(high_signal_margin, high_noise_margin)
+
+        # Low: Max of (Noise + 20% Signal) AND (Noise + 1 * StdDev)
+        low_signal_margin = self.calibrated_signal_strength * 0.2
+        low_noise_margin = 1.0 * std_noise_level
+        self.thresh_low = self.current_noise_floor + max(low_signal_margin, low_noise_margin)
 
         metric_name = "Contrast" if self.use_contrast else "Brightness"
-        logging.info("Noise (%s): %.1f | Est. ON: %.1f | Signal: %.1f",
-                    metric_name, avg_noise_level, estimated_on_level,
+        logging.info("Noise (%s): %.1f (Std: %.1f) | Est. ON: %.1f | Signal: %.1f",
+                    metric_name, avg_noise_level, std_noise_level, estimated_on_level,
                     self.calibrated_signal_strength)
-        logging.info("Set Initial Detection Threshold: %.1f", self.thresh_bright)
+        logging.info("Thresholds: High=%.1f (Start), Low=%.1f (Continue)",
+                     self.thresh_high, self.thresh_low)
 
         # Saturation check
         if self.log_saturation and np.mean(bg_brightness_samples) > 240: # Use mean of samples
             logging.warning("High ambient brightness detected! Sensor may be saturating.")
 
+        start_time = time.time()
+        pulses_found = 0
+        last_pulse = start_time
+
         # --- Monitoring Loop ---
         logging.info("--- MONITORING STARTED ---")
 
-        last_pulse = time.time()
         self.led_state = False  # Reset LED state
-        last_off_time = last_pulse  # Track last time LED was truly OFF
         last_active_time = last_pulse # Track last time signal was above threshold
+
+        # Estimate frame interval for duration correction
+        # We can use the interval between the last few frames if available, or default to 33ms
+        self.frame_interval = 0.033 # Default to 30fps
+        last_frame_time = time.time()
 
         # Stats aggregation
         report_period = 1.0
@@ -879,10 +912,21 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         pulse_count = 0
 
         while True:  # pylint: disable=too-many-nested-blocks
+            if max_pulses is not None and pulses_found >= max_pulses:
+                logging.info("Reached max pulses (%d). Exiting.", max_pulses)
+                break
             # Capture frame
             frame = self.cam.get_frame() # Changed from read_frame() to get_frame()
             if frame is None:
                 break
+
+            now = time.time()
+            # Update frame interval estimate
+            current_interval = now - last_frame_time
+            if 0.001 < current_interval < 0.2: # Filter reasonable values
+                # Simple moving average
+                self.frame_interval = (self.frame_interval * 0.9) + (current_interval * 0.1)
+            last_frame_time = now
 
             # Process ROI
             if self.roi:
@@ -1006,7 +1050,14 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             self.min_while_on = val
 
             # Check if LED is active (must be calculated before adaptive threshold update)
-            is_active = val > self.thresh_bright
+            # Hysteresis Thresholding
+            if not self.led_state:
+                # To turn ON, must exceed HIGH threshold
+                is_active = val > self.thresh_high
+            else:
+                # To stay ON, must exceed LOW threshold
+                is_active = val > self.thresh_low
+
             gap = now - last_pulse
 
             # Adaptive Threshold Update (Bidirectional)
@@ -1117,7 +1168,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                         # Confirmed OFF
                         self.led_state = False
                         # Duration ends at the last known active time
-                        duration = (last_active_time - self.led_on_time) * 1000 # ms
+                        # Duration ends at the last known active time
+                        # Add one frame interval to account for the duration of the last frame itself
+                        duration = (last_active_time - self.led_on_time + self.frame_interval) * 1000 # ms
 
                         # Calculate gap from the END of the previous pulse to the START of this one
                         # last_pulse tracks the END of the previous pulse
@@ -1180,7 +1233,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     self.saturation_count = 0
                     self.total_frames = 0
 
-            if isinstance(self.cam, X86CameraDriver):
+            if self.preview and isinstance(self.cam, X86CameraDriver):
                 debug = frame.copy()
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 1)
                 cv2.putText(debug, f"{val:.0f}", (x1, y1-5),
