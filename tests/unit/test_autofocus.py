@@ -64,5 +64,88 @@ class TestAutofocus(unittest.TestCase):
         print(f"Final focus: {final_focus}")
         self.assertTrue(140 <= final_focus <= 160, f"Focus {final_focus} not close to peak 150")
 
+    def test_autofocus_reverts_to_initial_if_no_improvement(self):
+        """
+        Test that autofocus reverts to the initial position if the sweep
+        does not find a significantly better focus.
+        """
+        # Setup
+        initial_focus = 100
+        initial_sharpness = 1000.0
+
+        # We want the sweep to find something WORSE or Same, ensuring it reverts.
+        # The logic in main.py likely seeks max sharpness.
+
+        # Mock the camera methods using MagicMock for more control than the simple MockCameraDriver
+        driver = MagicMock(spec=X86CameraDriver)
+        driver.cap = MagicMock()
+
+        camera_state = {'focus': initial_focus}
+
+        def set_focus(prop, val):
+            if prop == cv2.CAP_PROP_FOCUS:
+                camera_state['focus'] = int(val)
+                return True
+            return True
+
+        def get_focus(prop):
+            if prop == cv2.CAP_PROP_FOCUS:
+                return camera_state['focus']
+            return 0
+
+        driver.cap.set.side_effect = set_focus
+        driver.cap.get.side_effect = get_focus
+
+        # We also need get_frame to return something valid
+        driver.get_frame.return_value = np.zeros((100, 100), dtype=np.uint8)
+
+        # Mock PeakMonitor with this driver
+        with patch('led_detection.main.get_driver', return_value=driver), \
+             patch('cv2.Laplacian') as mock_laplacian:
+
+            monitor = PeakMonitor(interval=10, threshold=50, autofocus=True)
+            # Ensure the monitor uses our mock driver (get_driver patch handles init, but let's be safe)
+            monitor.cam = driver
+
+            # Counter to simulate noise/transient peaks
+            call_counts = {}
+
+            def get_sharpness(*_args, **_kwargs):
+                focus = camera_state['focus']
+                call_counts[focus] = call_counts.get(focus, 0) + 1
+
+                mock_res = MagicMock()
+
+                # Logic from original test:
+                if focus == initial_focus: # 100
+                    mock_res.var.return_value = initial_sharpness # 1000
+                elif focus == 220:
+                    # Simulating a transient peak that isn't sustained
+                    if call_counts[focus] == 1:
+                        mock_res.var.return_value = 2000.0
+                    else:
+                        mock_res.var.return_value = 500.0
+                else:
+                    mock_res.var.return_value = 0.0
+                return mock_res
+
+            mock_laplacian.side_effect = get_sharpness
+
+            # Run autofocus
+            monitor.autofocus_sweep()
+
+            # Verify that the FINAL focus set was the initial focus
+            # Get all calls to set focus
+            focus_calls = [
+                call.args[1]
+                for call in driver.cap.set.mock_calls
+                if call.args[0] == cv2.CAP_PROP_FOCUS
+            ]
+
+            final_set_focus = focus_calls[-1]
+
+            self.assertEqual(final_set_focus, initial_focus,
+                f"Autofocus should revert to initial {initial_focus}, but ended at {final_set_focus}")
+
 if __name__ == '__main__':
     unittest.main()

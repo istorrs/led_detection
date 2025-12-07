@@ -121,6 +121,24 @@ class LEDController:
             logging.error("Serial communication error: %s", e)
             return None
 
+    def _parse_time_str(self, time_str):
+        """Parse time string with units to milliseconds."""
+        # Handle decimal numbers
+        value_match = re.match(r'([\d\.]+)(.*)', time_str)
+        if not value_match:
+            return 0
+
+        value = float(value_match.group(1))
+        unit = value_match.group(2).strip()
+
+        if unit in ('us', 'μs'):
+            return int(value / 1000) if value >= 1000 else value / 1000.0
+        if unit == 's':
+            return int(value * 1000)
+
+        # Default to ms
+        return int(value)
+
     def set_pulse(self, duration_ms, period_ms, brightness_pct=100):
         """
         Configure LED pulse parameters.
@@ -146,7 +164,8 @@ class LEDController:
             logging.error("Brightness %d%% out of range (0-100)", brightness_pct)
             return False
 
-        command = f"led_pulse {duration_ms} {period_ms} {brightness_pct}"
+        # Add units to command
+        command = f"led_pulse {duration_ms}ms {period_ms}ms {brightness_pct}"
         logging.info("Sending: %s", command)
         response = self.send_command(command)
 
@@ -155,24 +174,41 @@ class LEDController:
 
         # Validate response matches command (if we got a confirmation line)
         # Format: "LED pulse set: 50ms ON @ 10% / 1000ms period"
+        # Or: "LED pulse set: 500μs ON @ 20% / 5.0s period"
         if "LED pulse set:" in response:
-            match = re.search(r'(\d+)ms ON @ (\d+)% / (\d+)ms period', response)
-            if match:
-                actual_dur = int(match.group(1))
-                actual_bright = int(match.group(2))
-                actual_period = int(match.group(3))
+            # Flexible regex to capture value and unit
+            # Group 1: duration value+unit
+            # Group 2: brightness
+            # Group 3: period value+unit
+            match = re.search(r'([\d\.]+(?:ms|us|μs|s)) ON @ (\d+)% / ([\d\.]+(?:ms|us|μs|s)) period', response)
 
-                if (actual_dur != duration_ms or
+            if match:
+                actual_dur_str = match.group(1)
+                actual_bright = int(match.group(2))
+                actual_period_str = match.group(3)
+
+                # Convert to ms for comparison
+                # Note: floating point comparison might need tolerance, but let's see
+                actual_dur_ms = self._parse_time_str(actual_dur_str)
+                actual_period_ms = self._parse_time_str(actual_period_str)
+
+                # Use a small tolerance for float conversions (e.g. 1ms)
+                if (abs(actual_dur_ms - duration_ms) > 1 or
                     actual_bright != brightness_pct or
-                    actual_period != period_ms):
+                    abs(actual_period_ms - period_ms) > 1):
                     logging.warning(
-                        "LED response mismatch! Sent: %dms/%dms/%d%%, Got: %dms/%dms/%d%%",
+                        "LED response mismatch! Sent: %dms/%dms/%d%%, Got: %s/%s/%d%% (Parsed: %.1fms/%.1fms)",
                         duration_ms, period_ms, brightness_pct,
-                        actual_dur, actual_period, actual_bright
+                        actual_dur_str, actual_period_str, actual_bright,
+                        actual_dur_ms, actual_period_ms
                     )
                     return False
                 logging.info("LED confirmed: %dms/%dms/%d%%",
-                           actual_dur, actual_period, actual_bright)
+                           duration_ms, period_ms, brightness_pct)
+            else:
+                logging.warning("Could not parse LED confirmation: %s", response)
+                # We return True here because technically the command succeeded if we got here,
+                # but we warn about parsing failure. This mimics previous behavior but with logging.
 
         return True
 

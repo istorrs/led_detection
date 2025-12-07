@@ -100,9 +100,10 @@ class TestPeakMonitorMethods(unittest.TestCase):
         self.patcher.stop()
 
     @patch('cv2.imshow')
+    @patch('cv2.destroyWindow')
     @patch('cv2.waitKey')
     @patch('time.time')
-    def test_aim_camera(self, mock_time, mock_wait, mock_imshow):
+    def test_aim_camera(self, mock_time, mock_wait, _mock_destroy, mock_imshow):
         # Simulate time passing: start, loop once, end
         # time.time() is called:
         # 1. In aim_camera to set end time
@@ -166,10 +167,10 @@ class TestMain(unittest.TestCase):
             mock_monitor_cls.assert_called_once()
             call_args = mock_monitor_cls.call_args
 
-            # Check positional args
-            self.assertEqual(call_args[0][0], 5.0) # interval
-            self.assertEqual(call_args[0][1], 20.0) # threshold
-            self.assertEqual(call_args[0][2], False) # preview (default)
+            # Check kwargs (main uses keyword args now)
+            self.assertEqual(call_args[1]['interval'], 5.0)
+            self.assertEqual(call_args[1]['threshold'], 20.0)
+            self.assertEqual(call_args[1]['preview'], False)
 
             # Check kwargs
             self.assertEqual(call_args[1]['use_contrast'], True)

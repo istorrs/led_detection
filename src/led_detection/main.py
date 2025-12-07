@@ -2,7 +2,6 @@
 import time
 import sys
 import platform
-import signal
 import logging
 import argparse
 import os
@@ -193,6 +192,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.min_signal_strength = threshold
         self.detected_peak_strength = 0.0
         self.detected_on_brightness = 0.0  # Actual brightness when ON
+        self.calibrated_off_level = None   # Calibrated OFF level (from exposure calibration)
 
         # Feature flags
         self.use_contrast = use_contrast
@@ -221,10 +221,13 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         self.last_exposure_adjust = 0  # Time of last exposure adjustment
         self.noise_floor_skip_count = 0  # Track how many updates we've skipped
 
+        self.frame_interval = 0.033
+
         # Initialized later
         self.thresh_high = 0.0
         self.thresh_low = 0.0
-        self.frame_interval = 0.033
+        self.verification_samples = []
+        self.pulse_samples = []
 
     def _measure_roi(self, roi):
         """Measure ROI using either contrast or brightness based on feature flag."""
@@ -393,13 +396,25 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     if current_val > self.min_signal_strength * 0.5:
                         if detection_start_time is None:
                             detection_start_time = time.time()
+                            self.verification_samples = [] # Initialize samples
                             logging.info("Potential signal (%.1f). Current: %.1f. Verifying...", max_val, current_val)
+
+                        # Collect samples for stats
+                        self.verification_samples.append(current_val)
 
                         # Debug logging
                         # logging.info("Time: %.2f, Start: %s, Diff: %.2f", time.time(), detection_start_time, time.time() - (detection_start_time or 0))
 
                         if time.time() - detection_start_time > dwell_time:
-                            logging.info("SIGNAL DETECTED! Score: %d", max_val)
+                            # Calculate stats
+                            if self.verification_samples:
+                                mean_val = np.mean(self.verification_samples)
+                                peak_val = np.max(self.verification_samples)
+                                std_val = np.std(self.verification_samples)
+                                logging.info("SIGNAL DETECTED! Score: %d | Stats: Mean=%.1f, Peak=%.1f, Std=%.1f",
+                                           max_val, mean_val, peak_val, std_val)
+                            else:
+                                logging.info("SIGNAL DETECTED! Score: %d", max_val)
 
                             # Lock ROI based on the COMBINED map (Bright + Changed)
                             self.lock_roi(max_loc, gray.shape, combined_map)
@@ -504,16 +519,20 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
     def calibrate_exposure(self):
         """Adaptively calibrate camera exposure to avoid saturation."""
         if not self.adaptive_exposure:
-            return
+            return None
 
         if not isinstance(self.cam, X86CameraDriver):
             logging.info("Adaptive exposure only supported for X86CameraDriver")
-            return
+            return None
 
         logging.info("Starting adaptive exposure calibration...")
+
         y1, y2, x1, x2 = self.roi
         # Target background brightness: 80
         # Target LED brightness (not saturated): 200
+
+        # Initialize current exposure once
+        current_exposure = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
 
         for iteration in range(10):
             # Capture frame and measure
@@ -526,21 +545,21 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                         iteration, bg_brightness, max_brightness)
 
             # Check if we're in good range
-            if bg_brightness < 150 and max_brightness < 250:
+            # Target lower background to ensure good SNR and avoid noise floor issues
+            if bg_brightness < 50 and max_brightness < 200:
                 logging.info("Exposure calibration complete: BG=%.1f, Peak=%.1f",
                             bg_brightness, max_brightness)
-                return
-
-            # Get current exposure
-            current_exposure = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
+                self.calibrated_off_level = bg_brightness
+                # Get current exposure to return it
+                return (bg_brightness, current_exposure)
 
             # Adjust exposure based on brightness
-            if bg_brightness > 150 or max_brightness > 250:
+            if bg_brightness > 50 or max_brightness > 200:
                 # Too bright, reduce exposure
                 new_exposure = current_exposure * 0.7
                 logging.info("Too bright, reducing exposure: %.1f -> %.1f",
                             current_exposure, new_exposure)
-            elif max_brightness < 150:
+            elif max_brightness < 50:
                 # Too dim, increase exposure
                 new_exposure = current_exposure * 1.3
                 logging.info("Too dim, increasing exposure: %.1f -> %.1f",
@@ -552,8 +571,43 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             # Apply new exposure
             self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, new_exposure)
             time.sleep(0.5)  # Allow sensor to settle
+            current_exposure = new_exposure # Update current_exposure for next iteration/return
 
         logging.info("Adaptive exposure complete after %d iterations", iteration + 1)
+        return (bg_brightness, current_exposure)
+
+    def lock_current_exposure(self):
+        """Locks the current exposure settings."""
+        logging.info("Locking current exposure...")
+        try:
+            # Get current values
+            curr_exp = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
+
+            # Switch to Manual (1)
+            self.cam.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+
+            # Re-apply the read exposure to ensure it sticks
+            self.cam.cap.set(cv2.CAP_PROP_EXPOSURE, curr_exp)
+
+            logging.info("Exposure locked at %.1f", curr_exp)
+
+            # Measure background now that exposure is locked
+            time.sleep(0.5)
+            f = self.cam.get_frame()
+
+            if self.roi:
+                y1, y2, x1, x2 = self.roi
+                roi = f[y1:y2, x1:x2]
+            else:
+                roi = f
+
+            self.calibrated_off_level = np.median(roi)
+            logging.info("Calibrated OFF level set to: %.1f", self.calibrated_off_level)
+
+            return True
+        except Exception as e: # pylint: disable=broad-exception-caught
+            logging.warning("Failed to lock exposure: %s", e)
+            return False
 
     def autofocus_sweep(self):
         """Automatically find optimal focus using bidirectional hill-climbing algorithm."""
@@ -626,7 +680,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 cv2.rectangle(preview_frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
                 cv2.putText(preview_frame, f"Focus: {focus_pos} | Sharpness: {sharpness:.1f}",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.imshow("Autofocus Sweep", preview_frame)
+                cv2.imshow("Camera Preview", preview_frame)
                 cv2.waitKey(1)
 
             # Log each measurement
@@ -714,6 +768,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         else:
             # Revert to initial - it was better
             final_sharpness, _ = measure_sharpness(initial_focus)
+            best_focus = initial_focus
 
             logging.warning("✗ Autofocus did not improve (%.1f%% change). "
                           "Keeping initial position %d",
@@ -740,8 +795,9 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         if self.preview:
             logging.info("Showing final result for 2 seconds...")
             time.sleep(2.0)
-            cv2.destroyWindow("Autofocus Sweep")
-            cv2.waitKey(1)  # Process window close event
+            # Do NOT destroy window here, keep it open for seamless transition
+            # cv2.destroyWindow("Autofocus Sweep")
+            # cv2.waitKey(1)
 
     def wait_for_led_off(self):
         """ Monitors ROI brightness until it drops significanty """
@@ -754,7 +810,13 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         roi = f[y1:y2, x1:x2]
         high_val = self._measure_roi(roi)
 
-        if self.adaptive_off:
+        if self.calibrated_off_level is not None:
+            # Use calibrated level if available (most robust)
+            # Allow some margin for noise (e.g. +30 or +50%)
+            drop_threshold = self.calibrated_off_level + 30.0
+            logging.info("Using Calibrated OFF Threshold: %.1f (Base: %.1f)",
+                        drop_threshold, self.calibrated_off_level)
+        elif self.adaptive_off:
             # Adaptive: measure initial variance to set noise-based threshold
             samples = []
             for _ in range(10):
@@ -794,11 +856,18 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             abs_threshold = 50 if self.use_contrast else 100
             abs_cond = curr_val < abs_threshold
 
-            if drop_cond or abs_cond:
+            # We need BOTH conditions ideally, or at least a very strong drop
+            # If we are using calibrated level, we trust it more.
+            if self.calibrated_off_level is not None:
+                if curr_val < (self.calibrated_off_level + 20.0):
+                    logging.info("LED OFF Confirmed (Calibrated): %.1f < %.1f", curr_val, self.calibrated_off_level + 20.0)
+                    time.sleep(0.1)
+                    return True
+            elif drop_cond or abs_cond:
                 # Found an OFF state - accept it immediately
                 # This works even if LED is flashing, we just catch it during OFF phase
-                logging.info("LED OFF Confirmed (Curr: %.1f < Threshold: %.1f)",
-                           curr_val, drop_threshold)
+                logging.info("LED OFF Confirmed (Curr: %.1f < Threshold: %.1f) [Drop: %s, Abs: %s]",
+                           curr_val, drop_threshold, drop_cond, abs_cond)
                 time.sleep(0.1) # Brief settling
                 return True
 
@@ -823,13 +892,28 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # pylint: disable=too-many-locals, too-many-statements, too-many-branches, too-many-nested-blocks
         # 3. Calibrate Noise Floor (OFF State)
         logging.info("Calibrating OFF-state noise floor...")
+
+        # Ensure we are in OFF state before calibrating
+        # We might have just come from a signal detection, so wait for OFF
+        self.wait_for_led_off()
+
+        # Debug: Check exposure
+        curr_exp = self.cam.cap.get(cv2.CAP_PROP_EXPOSURE)
+        logging.info("[Debug] Current Exposure: %.1f", curr_exp)
+
+        # Flush buffer to ensure we get fresh frames with current exposure
+        for _ in range(5):
+            self.cam.get_frame()
+
         y1, y2, x1, x2 = self.roi
         metric_samples = []
         bg_brightness_samples = []  # Track background for saturation
 
-        for _ in range(30):
-            f = self.cam.get_frame()
-            roi = f[y1:y2, x1:x2]
+        for _ in range(self.noise_floor_window):
+            frame = self.cam.get_frame()
+            if frame is None:
+                continue
+            roi = frame[y1:y2, x1:x2]
             metric_samples.append(self._measure_roi(roi))
             bg_brightness_samples.append(np.median(roi))  # Background brightness
 
@@ -844,13 +928,23 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # Estimate ON level and Signal Strength
         # Sanity check: detected_on_brightness must be significantly above noise floor
         # Otherwise, we likely measured the LED after it turned off
-        if (hasattr(self, 'detected_on_brightness') and
-            self.detected_on_brightness > avg_noise_level + 10.0): # Require at least 10 units above noise
+        # Estimate ON level and Signal Strength
+        # Sanity check: detected_on_brightness must be significantly above noise floor
+        # AND comparable to the peak strength we saw during detection
+        use_on_brightness = False
+        if hasattr(self, 'detected_on_brightness'):
+            signal_from_brightness = self.detected_on_brightness - avg_noise_level
+            # It must be > 10 units AND at least 50% of the peak strength we saw
+            if (signal_from_brightness > 10.0 and
+                signal_from_brightness > self.detected_peak_strength * 0.5):
+                use_on_brightness = True
+
+        if use_on_brightness:
             estimated_on_level = self.detected_on_brightness
             logging.info("[Debug] Using detected_on_brightness: %.1f", estimated_on_level)
         else:
             if hasattr(self, 'detected_on_brightness'):
-                logging.warning("detected_on_brightness (%.1f) too close to noise (%.1f). Fallback to peak strength.",
+                logging.warning("detected_on_brightness (%.1f) too close to noise (%.1f) or weak. Fallback to peak strength.",
                               self.detected_on_brightness, avg_noise_level)
 
             logging.info("[Debug] Using detected_peak_strength: %.1f", self.detected_peak_strength)
@@ -864,15 +958,15 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # High threshold to START detection (reject noise)
         # Low threshold to CONTINUE detection (capture tails)
 
-        # High: Max of (Noise + 50% Signal) AND (Noise + 3 * StdDev)
-        high_signal_margin = self.calibrated_signal_strength * 0.5
-        high_noise_margin = 3.0 * std_noise_level
-        self.thresh_high = self.current_noise_floor + max(high_signal_margin, high_noise_margin)
+        # High: Max of (Noise + 30% Signal) AND (Noise + 2 * StdDev)
+        high_signal_margin = self.calibrated_signal_strength * 0.3
+        high_noise_margin = 2.0 * std_noise_level
+        self.thresh_high = min(253.0, self.current_noise_floor + max(high_signal_margin, high_noise_margin))
 
-        # Low: Max of (Noise + 20% Signal) AND (Noise + 1 * StdDev)
+        # Low: Max of (Noise + 20% Signal) AND (Noise + 2 * StdDev)
         low_signal_margin = self.calibrated_signal_strength * 0.2
-        low_noise_margin = 1.0 * std_noise_level
-        self.thresh_low = self.current_noise_floor + max(low_signal_margin, low_noise_margin)
+        low_noise_margin = 2.0 * std_noise_level
+        self.thresh_low = min(253.0, self.current_noise_floor + max(low_signal_margin, low_noise_margin))
 
         metric_name = "Contrast" if self.use_contrast else "Brightness"
         logging.info("Noise (%s): %.1f (Std: %.1f) | Est. ON: %.1f | Signal: %.1f",
@@ -888,6 +982,7 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         start_time = time.time()
         pulses_found = 0
         last_pulse = start_time
+        last_off_time = start_time # Initialize to avoid UnboundLocalError
 
         # --- Monitoring Loop ---
         logging.info("--- MONITORING STARTED ---")
@@ -1159,6 +1254,10 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                     # LED just turned ON
                     self.led_state = True
                     self.led_on_time = now
+                    self.pulse_samples = [] # Initialize pulse samples
+
+                # Collect samples while ON
+                self.pulse_samples.append(val)
             else:
                 # LED is currently below threshold
                 if self.led_state:
@@ -1183,9 +1282,17 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                         if duration >= self.min_pulse_duration:
                             last_pulse = last_active_time # Update last pulse end time
                             if gap > 0.1: # Reduced to 0.1s to catch faster pulses
+                                # Calculate pulse stats
+                                stats_str = ""
+                                if hasattr(self, 'pulse_samples') and self.pulse_samples:
+                                    p_mean = np.mean(self.pulse_samples)
+                                    p_peak = np.max(self.pulse_samples)
+                                    p_std = np.std(self.pulse_samples)
+                                    stats_str = f" | Mean: {p_mean:.0f}, Peak: {p_peak:.0f}, Std: {p_std:.1f}"
+
                                 timestamp = get_timestamp()
                                 sys.stdout.write(f"\033[96m[{timestamp}] [PULSE DETECTED] "
-                                               f"Gap: {gap:.1f}s | Duration: {duration:.0f}ms\033[0m\n")
+                                               f"Gap: {gap:.1f}s | Duration: {duration:.0f}ms{stats_str}\033[0m\n")
 
                                 if on_pulse_callback:
                                     on_pulse_callback(timestamp, duration, gap)
@@ -1242,6 +1349,509 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                 cv2.imshow("Monitor", debug)
                 if cv2.waitKey(1) == ord('q'):
                     break
+
+    def setup_camera_locked(self):
+        """
+        Sets up the camera for one-shot detection:
+        1. Auto-Exposure to find scene.
+        2. Autofocus sweep.
+        3. Lock Exposure and Focus.
+        """
+        logging.info("Setting up camera (Locked Mode)...")
+
+        # 1. Start with Auto-Exposure
+        try:
+            self.cam.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) # Auto
+            logging.info("Enabled Auto-Exposure")
+            time.sleep(1.0) # Settle
+        except Exception as e: # pylint: disable=broad-exception-caught
+            logging.warning("Failed to set Auto-Exposure: %s", e)
+
+        # if self.preview:
+        #     self.aim_camera()
+
+        # 2. Autofocus
+        self.autofocus_sweep()
+
+        # 3. Lock Exposure
+        self.lock_current_exposure()
+
+        logging.info("Camera setup complete (Locked).")
+
+    def capture_frame_buffer(self, duration):
+        """
+        Captures a sequence of frames for the specified duration.
+        Returns a list of (timestamp, frame) tuples.
+        """
+        # pylint: disable=too-many-nested-blocks
+        logging.info("Capturing frame buffer for %.1fs...", duration)
+        frames = []
+        start_time = time.time()
+
+        # Visualization helper state
+        viz_baseline = None
+
+        while (time.time() - start_time) < duration:
+            frame = self.cam.get_frame()
+            if frame is not None:
+                frames.append((time.time(), frame.copy()))
+
+                if self.preview:
+                    preview_frame = frame.copy()
+                    if self.roi:
+                        y1, y2, x1, x2 = self.roi
+                        # Draw ROI box
+                        cv2.rectangle(preview_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        # Draw label
+                        cv2.putText(preview_frame, "ROI", (x1, y1-5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    else:
+                        # Visualize potential ROI during scan
+                        if len(frame.shape) == 3 and frame.shape[2] == 3:
+                            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        else:
+                            gray = frame
+
+                        if viz_baseline is None:
+                            viz_baseline = gray
+                        else:
+                            diff = cv2.absdiff(gray, viz_baseline)
+                            _, max_val, _, max_loc = cv2.minMaxLoc(diff)
+
+                            # Draw circles to show we are scanning/detecting activity
+                            if max_val > 10: # Minimum activity threshold
+                                cv2.circle(preview_frame, max_loc, 10, (0, 255, 255), 1)
+                                cv2.circle(preview_frame, max_loc, 20, (0, 255, 255), 1)
+                                cv2.putText(preview_frame, f"Scanning... {max_val:.0f}", (10, 30),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                    cv2.imshow("Camera Preview", preview_frame)
+                    cv2.waitKey(1)
+
+        logging.info("Captured %d frames in %.1fs (%.1f FPS)",
+                     len(frames), duration, len(frames)/duration)
+        return frames
+
+    def _find_roi_from_variance(self, frames):
+        """Helper to find ROI based on variance map."""
+        # pylint: disable=too-many-locals
+        # Convert to grayscale first if needed
+        gray_frames = []
+        for _, f in frames:
+            if len(f.shape) == 3 and f.shape[2] == 3:
+                gray_frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+            else:
+                gray_frames.append(f) # Already grayscale or single channel
+
+        stack = np.stack(gray_frames, axis=0)
+
+        # Calculate variance map
+        variance_map = np.var(stack, axis=0)
+
+        # Find the area with max variance
+        # Blur slightly to reduce noise
+        variance_map = cv2.GaussianBlur(variance_map, (5, 5), 0)
+
+        # Find max location
+        _, max_val, _, max_loc = cv2.minMaxLoc(variance_map)
+        logging.info("Max variance: %.1f at %s", max_val, max_loc)
+
+        if max_val < 10.0: # Threshold for "no activity"
+            logging.warning("No significant activity detected.")
+            return None
+
+        # Define ROI around max location (e.g., 20x20)
+        x, y = max_loc
+        w, h = 20, 20
+        x1 = max(0, x - w//2)
+        y1 = max(0, y - h//2)
+        x2 = min(stack.shape[2], x + w//2)
+        y2 = min(stack.shape[1], y + h//2)
+
+        roi = (y1, y2, x1, x2)
+        logging.info("ROI found: %s", roi)
+        return roi
+
+    def analyze_frame_buffer(self, frames):
+        """
+        Analyzes the frame buffer to find the LED ROI and extract the signal.
+        Returns (roi, signal_values, timestamps).
+        """
+        # pylint: disable=too-many-locals
+        if not frames:
+            return None, [], []
+
+        logging.info("Analyzing %d frames...", len(frames))
+
+        # 1. Compute Frame Differences to find ROI (if not already found)
+        # Check self.roi explicitly in case it was set externally (e.g., by pre-scan)
+        if self.roi is None:
+            self.roi = self._find_roi_from_variance(frames)
+            if self.roi is None:
+                return None, [], []
+
+        y1, y2, x1, x2 = self.roi
+
+        # 2. Extract Signal from ROI
+        signal_values = []
+        timestamps = [ts for ts, _ in frames]
+
+        # Need to ensure frames are grayscale for signal extraction
+        gray_frames = []
+        for _, f in frames:
+            if len(f.shape) == 3 and f.shape[2] == 3:
+                gray_frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+            else:
+                gray_frames.append(f)
+
+        for i in range(len(frames)):
+            # Average brightness in ROI
+            roi_frame = gray_frames[i][y1:y2, x1:x2]
+            avg_val = np.mean(roi_frame)
+            signal_values.append(avg_val)
+
+        return self.roi, signal_values, timestamps
+
+    def _detect_pulses(self, signal_values, timestamps, threshold, avg_frame_interval):
+        """Helper to detect pulses from binary signal."""
+        # pylint: disable=too-many-locals
+        binary_signal = [1 if v > threshold else 0 for v in signal_values]
+        pulses = []
+        current_state = 0
+        start_time = 0
+        start_index = 0
+
+        # We need to access previous values for interpolation
+        for i, val in enumerate(binary_signal):
+            if i == 0:
+                current_state = val
+                if val == 1:
+                    start_time = timestamps[0]
+                    start_index = 0
+                continue
+
+            state = val # This is binary_signal[i]
+            t2 = timestamps[i]
+            t1 = timestamps[i-1]
+            v2 = signal_values[i]
+            v1 = signal_values[i-1]
+
+            # Rising Edge: 0 -> 1
+            if current_state == 0 and state == 1:
+                # Interpolate exact crossing time
+                # v1 <= threshold < v2
+                denom = v2 - v1
+                fraction = (threshold - v1) / denom if denom != 0 else 0.5
+                start_time = t1 + (t2 - t1) * fraction
+                start_index = i
+                current_state = 1
+
+            # Falling Edge: 1 -> 0
+            elif current_state == 1 and state == 0:
+                # Interpolate exact crossing time
+                # v1 > threshold >= v2
+                denom = v2 - v1
+                fraction = (threshold - v1) / denom if denom != 0 else 0.5
+                end_time = t1 + (t2 - t1) * fraction
+
+                duration = (end_time - start_time) * 1000.0 # ms
+
+                # Calculate frame-based duration
+                # Number of frames where signal was 1 (approximate)
+                # This is just end_index - start_index?
+                # binary_signal[start_index] is 1. binary_signal[i] is 0.
+                # So frames are start_index to i-1.
+                num_frames = i - start_index
+                duration_frames = num_frames * avg_frame_interval * 1000.0
+
+                pulses.append({
+                    'start': start_time,
+                    'end': end_time,
+                    'duration': duration,
+                    'num_frames': num_frames,
+                    'duration_frames': duration_frames
+                })
+                current_state = 0
+        return pulses
+
+    def verify_signal(self, signal_values, timestamps, expected_period, expected_duration, tolerance=0.2, frames=None):
+        """
+        Verifies if the extracted signal matches the expected parameters.
+        If frames is provided, saves frames for invalid pulses to /tmp/badpulses.
+        """
+        # pylint: disable=too-many-locals, too-many-branches, too-many-nested-blocks
+        if not signal_values:
+            return False
+
+        # Normalize signal
+        sig_min = np.min(signal_values)
+        sig_max = np.max(signal_values)
+        sig_range = sig_max - sig_min
+
+        logging.info("Signal Range: %.1f - %.1f (Delta: %.1f)", sig_min, sig_max, sig_range)
+
+        if sig_range < 10.0:
+            logging.warning("Signal range too low (%.1f). Noise?", sig_range)
+            return False
+
+        # Thresholding
+        # Use mid-point
+        threshold = sig_min + (sig_range * 0.5)
+
+        # Calculate average frame interval
+        avg_frame_interval = 0.0
+        if len(timestamps) > 1:
+            avg_frame_interval = (timestamps[-1] - timestamps[0]) / (len(timestamps) - 1)
+
+        # Detect pulses
+        pulses = self._detect_pulses(signal_values, timestamps, threshold, avg_frame_interval)
+
+        logging.info("Detected %d pulses", len(pulses))
+        for p in pulses:
+            logging.info("  Duration: %.1fms (Time) vs %.1fms (Frames: %d)",
+                         p['duration'], p['duration_frames'], p['num_frames'])
+
+        if len(pulses) < 2:
+            logging.warning("Not enough pulses detected.")
+            return False
+
+        # Prepare bad pulses directory
+        # User wants a library of bad pulses, so use a timestamped folder for each run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bad_pulse_base_dir = f"/tmp/bad_pulses/run_{timestamp}"
+
+        if frames and not os.path.exists(bad_pulse_base_dir):
+            os.makedirs(bad_pulse_base_dir)
+            logging.info("Created bad pulse directory: %s", bad_pulse_base_dir)
+
+        # Verify Duration and Period
+        valid_pulses = 0
+        for i, p in enumerate(pulses):
+            is_pulse_valid = True
+
+            # Period Check (if not first)
+            period = 0.0
+            if i > 0:
+                period = p['start'] - pulses[i-1]['start']
+                period_diff = abs(period - expected_period)
+                if period_diff > (expected_period * tolerance):
+                    logging.warning("Pulse %d: Duration=%.1fms, Period=%.3fs [INVALID PERIOD] (Exp: %.3fs)",
+                                  i, p['duration'], period, expected_period)
+                    is_pulse_valid = False
+
+            # Duration Check
+            dur_diff = abs(p['duration'] - expected_duration)
+            if dur_diff > (expected_duration * tolerance) and dur_diff > 10.0:
+                logging.warning("Pulse %d: Duration=%.1fms, Period=%.3fs [INVALID DURATION] (Exp: %dms)",
+                              i, p['duration'], period, expected_duration)
+                is_pulse_valid = False
+
+            # Collect raw signal values for this pulse
+            pulse_signal_values = []
+            if frames:
+                # Find frames within start and end time
+                # Use slightly wider window for logging context
+                p_start = p['start'] - 0.1
+                p_end = p['end'] + 0.1
+                for j, (t, _) in enumerate(frames): # Unused frame
+                    if p_start <= t <= p_end:
+                        if j < len(signal_values):
+                            pulse_signal_values.append(f"{signal_values[j]:.1f}")
+
+            if is_pulse_valid:
+                logging.info("Pulse %d: Duration=%.1fms, Period=%.3fs [VALID]", i, p['duration'], period)
+                logging.info("  Raw Signal: %s", pulse_signal_values)
+                valid_pulses += 1
+            else:
+                # Save frames for bad pulse
+                if frames:
+                    # Create subdirectory for this pulse
+                    pulse_dir = os.path.join(bad_pulse_base_dir, f"pulse_{i}")
+                    if not os.path.exists(pulse_dir):
+                        os.makedirs(pulse_dir)
+
+                    # Find frames within start and end time
+                    p_start = p['start'] - 0.1
+                    p_end = p['end'] + 0.1
+
+                    saved_count = 0
+                    for j, (t, frame) in enumerate(frames):
+                        if p_start <= t <= p_end:
+                            # Append signal value to filename
+                            sig_val_str = ""
+                            if j < len(signal_values):
+                                sig_val_str = f"_val_{signal_values[j]:.1f}"
+
+                            fname = os.path.join(pulse_dir, f"frame_{j}_{t:.3f}{sig_val_str}.jpg")
+                            cv2.imwrite(fname, frame)
+                            saved_count += 1
+
+                    logging.info("Saved %d frames for bad pulse %d to %s", saved_count, i, pulse_dir)
+                    logging.info("Raw signal values for bad pulse %d: %s", i, pulse_signal_values)
+
+        # Quality Check
+        total_pulses = len(pulses)
+        valid_ratio = valid_pulses / total_pulses if total_pulses > 0 else 0.0
+        logging.info("Signal Quality: %d/%d valid pulses (%.1f%%)", valid_pulses, total_pulses, valid_ratio * 100)
+
+        if valid_ratio < 0.5:
+            logging.warning("Signal quality too low (<50%% valid).")
+            return False
+
+        if valid_pulses >= 2: # Require at least 2 valid pulses (1 period check)
+            logging.info("Signal Verified! (%d valid pulses)", valid_pulses)
+            return True
+
+        return False
+
+    def run_one_shot(self, expected_period, expected_duration, tolerance=0.2, num_pulses=4):
+        """
+        Run a one-shot detection sequence.
+
+        Args:
+            expected_period: Expected pulse period in seconds.
+            expected_duration: Expected pulse duration in ms.
+            num_pulses: Number of pulses to capture (default 4).
+        Run a one-shot detection sequence using Frame Difference approach.
+        """
+        logging.info("Starting One-Shot Detection (Period: %.2fs, Duration: %dms, Tolerance: %.1f, Pulses: %d)",
+                    expected_period, expected_duration, tolerance, num_pulses)
+
+        self.cam.start()
+
+        # 1. Setup Camera (Locked Mode)
+        self.setup_camera_locked()
+
+        # 2. Pre-capture ROI Scan
+        # Scan for at least 2 pulses to ensure we catch one
+        scan_duration = max(2.0, expected_period * 2.1)
+        logging.info("Performing pre-capture ROI scan (%.1fs)...", scan_duration)
+
+        pre_frames = self.capture_frame_buffer(scan_duration)
+        self.roi, _, _ = self.analyze_frame_buffer(pre_frames)
+
+        if self.roi:
+            logging.info("Pre-capture ROI found: %s", self.roi)
+        else:
+            logging.warning("Pre-capture ROI scan failed. Will attempt post-capture.")
+
+        # 3. Capture Frame Buffer
+        # Capture for num_pulses periods + buffer
+        capture_duration = max(5.0, expected_period * (num_pulses + 1.0))
+        frames = self.capture_frame_buffer(capture_duration)
+
+        self.cam.stop()
+
+        if not frames:
+            logging.error("Failed to capture frames.")
+            return False
+
+        logging.info("Analyzing %d frames...", len(frames))
+
+        # 4. Analyze Frames (if ROI not found yet, it will be found here)
+        # If ROI was found in pre-scan, analyze_frame_buffer should use it?
+        # analyze_frame_buffer calculates ROI if self.roi is None.
+        # So if we set self.roi above, it should use it?
+        # Wait, analyze_frame_buffer implementation (lines 1400+) RE-CALCULATES ROI every time!
+        # It doesn't check self.roi!
+        # I need to modify analyze_frame_buffer to respect self.roi if set.
+        _, signal_values, timestamps = self.analyze_frame_buffer(frames)
+
+        # 5. Verify Signal
+        success = self.verify_signal(signal_values, timestamps, expected_period, expected_duration, tolerance, frames)
+
+        if self.preview:
+            cv2.destroyAllWindows()
+
+        if success:
+            print("\n[SUCCESS] Signal Verified!")
+            return True
+        print("\n[FAILURE] Signal Verification Failed.")
+        return False
+
+    def run_offline_analysis(self, folder_path, expected_period, expected_duration, tolerance=0.2):
+        """
+        Run detection on a folder of images (offline mode).
+
+        Args:
+            folder_path: Path to folder containing .jpg images.
+            expected_period: Expected pulse period in seconds.
+            expected_duration: Expected pulse duration in ms.
+            tolerance: Tolerance for timing validation.
+        """
+        # pylint: disable=too-many-locals
+        logging.info("Starting Offline Analysis on folder: %s", folder_path)
+
+        if not os.path.exists(folder_path):
+            logging.error("Folder not found: %s", folder_path)
+            return False
+
+        # 1. Read images
+        frames = []
+        files = sorted([f for f in os.listdir(folder_path) if f.endswith(".jpg")])
+
+        if not files:
+            logging.error("No .jpg images found in %s", folder_path)
+            return False
+
+        logging.info("Found %d images", len(files))
+
+        for f in files:
+            # Parse timestamp from filename
+            # Format: frame_INDEX_TIMESTAMP.jpg or frame_INDEX_TIMESTAMP_val_XXX.jpg
+            # We need the timestamp part.
+            # Example: frame_0_1.234.jpg -> 1.234
+            try:
+                parts = f.split('_')
+                # parts[0] = frame
+                # parts[1] = index
+                # parts[2] = timestamp (maybe with .jpg or _val...)
+
+                ts_part = parts[2]
+                if ts_part.endswith(".jpg"):
+                    ts_str = ts_part[:-4]
+                else:
+                    # Handle _val_XXX case
+                    # If parts has more elements, timestamp is likely just parts[2]
+                    # But we need to be careful if timestamp contains underscores (unlikely based on my code)
+                    # My code uses f"frame_{j}_{t:.3f}" -> 1.234
+                    # So it should be safe to take parts[2] and strip .jpg or stop at next _
+                    ts_str = ts_part
+                    if ".jpg" in ts_str:
+                        ts_str = ts_str.replace(".jpg", "")
+
+                t = float(ts_str)
+
+                img_path = os.path.join(folder_path, f)
+                img = cv2.imread(img_path)
+                if img is not None:
+                    frames.append((t, img))
+                else:
+                    logging.warning("Failed to read image: %s", f)
+
+            except Exception as e: # pylint: disable=broad-exception-caught
+                logging.warning("Skipping file %s: %s", f, e)
+                continue
+
+        if not frames:
+            logging.error("No valid frames loaded.")
+            return False
+
+        # Sort by timestamp just in case
+        frames.sort(key=lambda x: x[0])
+
+        logging.info("Loaded %d frames. Duration: %.1fs", len(frames), frames[-1][0] - frames[0][0])
+
+        # 2. Analyze Frames
+        # We need to set self.roi if not set?
+        # analyze_frame_buffer calls find_roi_from_variance if self.roi is None.
+        # This should work fine.
+        _, signal_values, timestamps = self.analyze_frame_buffer(frames)
+
+        # 3. Verify Signal
+        success = self.verify_signal(signal_values, timestamps, expected_period, expected_duration, tolerance, frames)
+
+        return success
 
     def run(self):
         """Run the monitor loop."""
@@ -1330,6 +1940,17 @@ To disable a feature, use --no-<feature>, e.g., --no-autofocus
                        type=int, default=25,
                        help="Minimum pulse duration in ms to count as valid (default: 25)")
 
+    # One-shot mode arguments
+    parser.add_argument("--expected-period", dest="expected_period", type=float,
+                       help="Expected pulse period in seconds (enables one-shot mode)")
+    parser.add_argument("--expected-duration", dest="expected_duration", type=int,
+                       help="Expected pulse duration in ms (required for one-shot mode)")
+    parser.add_argument("--tolerance", dest="tolerance", type=float, default=0.2,
+                       help="Tolerance for timing validation (default: 0.2 = 20%%)")
+
+    parser.add_argument("--offline", dest="offline_folder", type=str,
+                       help="Run detection on a folder of images (offline mode)")
+
     args = parser.parse_args()
 
     setup_logging(args.debug)
@@ -1344,28 +1965,50 @@ To disable a feature, use --no-<feature>, e.g., --no-autofocus
         logging.debug("  adaptive_exposure: %s", args.adaptive_exposure)
         logging.debug("  autofocus: %s", args.autofocus)
 
-    monitor = PeakMonitor(
-        args.interval,
-        args.threshold,
-        args.preview,
-        use_contrast=args.use_contrast,
-        adaptive_roi=args.adaptive_roi,
-        adaptive_off=args.adaptive_off,
-        log_saturation=args.log_saturation,
-        adaptive_exposure=args.adaptive_exposure,
-        autofocus=args.autofocus,
-        min_pulse_duration=args.min_pulse_duration
-    )
+    try:
+        monitor = PeakMonitor(
+            interval=args.interval,
+            threshold=args.threshold,
+            preview=args.preview,
+            use_contrast=args.use_contrast,
+            adaptive_roi=args.adaptive_roi,
+            adaptive_off=args.adaptive_off,
+            log_saturation=args.log_saturation,
+            adaptive_exposure=args.adaptive_exposure,
+            autofocus=args.autofocus,
+            min_pulse_duration=args.min_pulse_duration
+        )
 
-    def cleanup(_s, _f):
-        """Signal handler for cleanup."""
-        monitor.cam.stop()
-        # pylint: disable=no-member
-        cv2.destroyAllWindows()
+        if args.offline_folder:
+            # Offline Mode
+            if not args.expected_period or not args.expected_duration:
+                logging.error("Offline mode requires --expected-period and --expected-duration")
+                sys.exit(1)
+
+            monitor.run_offline_analysis(
+                args.offline_folder,
+                args.expected_period,
+                args.expected_duration,
+                args.tolerance
+            )
+
+        elif args.expected_period and args.expected_duration:
+            # One-Shot Mode
+            monitor.run_one_shot(
+                args.expected_period,
+                args.expected_duration,
+                args.tolerance
+            )
+        else:
+            # Continuous Mode
+            monitor.run()
+
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user")
         sys.exit(0)
-
-    signal.signal(signal.SIGINT, cleanup)
-    monitor.run()
+    except Exception as e: # pylint: disable=broad-exception-caught
+        logging.exception("Fatal error: %s", e)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
