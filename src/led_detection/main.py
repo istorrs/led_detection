@@ -1918,7 +1918,7 @@ To disable a feature, use --no-<feature>, e.g., --no-autofocus
     parser.add_argument("--adaptive-off", dest="adaptive_off", action="store_true", default=True,
                        help="Use variance-based OFF detection (default)")
     parser.add_argument("--no-adaptive-off", dest="adaptive_off", action="store_false",
-                       help="Use fixed 60% drop threshold")
+                       help="Use fixed 60%% drop threshold")
 
     parser.add_argument("--log-saturation", dest="log_saturation",
                        action="store_true", default=True,
