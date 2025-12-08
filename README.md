@@ -118,6 +118,11 @@ python3 src/led_detection/main.py --interval 60 \
 python3 src/led_detection/main.py --interval 60 --adaptive-exposure --debug
 ```
 
+**Batch Classify a Folder of Image Sequences:**
+```bash
+python3 src/led_detection/main.py --classify-folder ./TestData --output-json ./results.json
+```
+
 ---
 
 ## 🧠 How It Works
@@ -272,6 +277,30 @@ The system continuously updates the threshold based on LED state:
 - Controlled indoor environment
 - Very dim LEDs that need maximum sensitivity
 - Stable lighting conditions
+
+### Batch Offline Classification (`--classify-folder`)
+
+Recursively scans a directory tree for image sequences and generates a classification report.
+
+**Features:**
+- **Blind Detection**: Detects pulses without knowing expected period/duration.
+- **Robust Parsing**: Handles various filename formats (fallback to 30 FPS).
+- **Metadata Extraction**: Identifies AED type ("CR2" vs "Philips") and repeat interval.
+- **JSON Output**: Produces a detailed report for automation.
+
+**Example Output (`results.json`):**
+```json
+[
+    {
+        "name": "3598_run1_phoneflash_bright",
+        "directory": "TestData/CR2/3598_run1_phoneflash_bright",
+        "expected_count": 2,
+        "expected_frames": [79, 261],
+        "repeat_interval_sec": 2.0,
+        "aed_type": "CR2"
+    }
+]
+```
 
 ---
 

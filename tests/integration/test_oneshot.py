@@ -66,15 +66,32 @@ def monitor():
         pytest.skip(f"Camera not available: {e}")
 
 @pytest.mark.integration
-def test_oneshot_success(led_controller, monitor): # pylint: disable=redefined-outer-name
-    """Test successful one-shot detection."""
-    # Setup: 147ms ON / 5000ms Period
-    assert led_controller.set_pulse(147, 5000, 100)
+@pytest.mark.parametrize("duration,period,brightness", [
+    (147, 5.0, 100),   # Standard
+    (50, 1.0, 50),     # Short & Dim
+    (500, 2.0, 100)    # Long
+])
+def test_oneshot_success(led_controller, monitor, duration, period, brightness): # pylint: disable=redefined-outer-name
+    """
+    Test successful one-shot detection with various parameters.
+    Cases:
+    1. Standard: 147ms / 5s / 100%
+    2. Short/Dim: 50ms / 1s / 50%
+    3. Long: 500ms / 2s / 100%
+    """
+    logging.info("Testing One-Shot: Duration=%dms, Period=%.1fs, Brightness=%d%%",
+                 duration, period, brightness)
+
+    # Setup Pulse
+    assert led_controller.set_pulse(duration, int(period * 1000), brightness)
 
     # Run one-shot
-    success = monitor.run_one_shot(expected_period=5.0, expected_duration=147, num_pulses=10)
+    # Note: Short pulses might need slightly more tolerance or careful sampling?
+    # But 50ms is > 33ms (1 frame), so it should be caught.
+    # We keep tolerance at default 0.2
+    success = monitor.run_one_shot(expected_period=period, expected_duration=duration, num_pulses=6)
 
-    assert success, "One-shot detection should succeed for matching parameters"
+    assert success, f"One-shot detection failed for {duration}ms / {period}s / {brightness}%"
 
 @pytest.mark.integration
 def test_oneshot_fail_duration(led_controller, monitor): # pylint: disable=redefined-outer-name

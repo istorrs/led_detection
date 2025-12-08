@@ -1,0 +1,200 @@
+[
+    {
+        "name": "false_positive_ambient_change",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/Philips/false_positive_ambient_change",
+        "expected_count": 22,
+        "expected_frames": [
+            5,
+            13,
+            18,
+            23,
+            29,
+            34,
+            45,
+            51,
+            56,
+            61,
+            65,
+            71,
+            75,
+            78,
+            82,
+            86,
+            89,
+            92,
+            98,
+            105,
+            109,
+            113
+        ],
+        "repeat_interval_sec": 0.17125714285714289,
+        "aed_type": "Philips"
+    },
+    {
+        "name": "Philips_trial",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/Philips/Philips_trial",
+        "expected_count": 0,
+        "expected_frames": [],
+        "repeat_interval_sec": 0.0,
+        "aed_type": "Philips"
+    },
+    {
+        "name": "AI_LED_frames_pwm",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/AI_LED_frames_pwm",
+        "expected_count": 18,
+        "expected_frames": [
+            12,
+            16,
+            22,
+            27,
+            31,
+            37,
+            42,
+            47,
+            51,
+            56,
+            62,
+            66,
+            72,
+            77,
+            82,
+            86,
+            91,
+            96
+        ],
+        "repeat_interval_sec": 0.16454117647058825,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "0001_DJH",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/0001_DJH",
+        "expected_count": 2,
+        "expected_frames": [
+            6,
+            188
+        ],
+        "repeat_interval_sec": 6.060600000000001,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "4765_run1_desklamp_bright_15gt_miss_188",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/4765_run1_desklamp_bright_15gt_miss_188",
+        "expected_count": 2,
+        "expected_frames": [
+            6,
+            188
+        ],
+        "repeat_interval_sec": 6.060600000000001,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "shutter_1",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/shutter_1",
+        "expected_count": 1,
+        "expected_frames": [
+            357
+        ],
+        "repeat_interval_sec": 0.0,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "raw_end_of_event",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/raw_end_of_event",
+        "expected_count": 10,
+        "expected_frames": [
+            0,
+            4,
+            7,
+            11,
+            23,
+            59,
+            61,
+            65,
+            122,
+            131
+        ],
+        "repeat_interval_sec": 0.47360000000000013,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "4252_run1_desklamp_bright",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/4252_run1_desklamp_bright",
+        "expected_count": 1,
+        "expected_frames": [
+            127
+        ],
+        "repeat_interval_sec": 0.0,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "3039_run1_ambient_office_dim",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/3039_run1_ambient_office_dim",
+        "expected_count": 2,
+        "expected_frames": [
+            10,
+            122
+        ],
+        "repeat_interval_sec": 3.7296000000000005,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "AI_led_frames",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/AI_led_frames",
+        "expected_count": 1,
+        "expected_frames": [
+            51
+        ],
+        "repeat_interval_sec": 0.0,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "3039_Dave_modified",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/3039_Dave_modified",
+        "expected_count": 8,
+        "expected_frames": [
+            12,
+            24,
+            122,
+            130,
+            182,
+            184,
+            212,
+            214
+        ],
+        "repeat_interval_sec": 0.9609428571428573,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "3251_run1_phoneflash",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/3251_run1_phoneflash",
+        "expected_count": 2,
+        "expected_frames": [
+            4,
+            63
+        ],
+        "repeat_interval_sec": 1.9647000000000001,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "4765_run1_dark_15gt_518",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/4765_run1_dark_15gt_518",
+        "expected_count": 2,
+        "expected_frames": [
+            6,
+            188
+        ],
+        "repeat_interval_sec": 6.060600000000001,
+        "aed_type": "CR2"
+    },
+    {
+        "name": "3598_run1_phoneflash_bright",
+        "directory": "/home/rtp-lab/work/github/ReadinessPython/TestData/CR2/3598_run1_phoneflash_bright",
+        "expected_count": 2,
+        "expected_frames": [
+            79,
+            261
+        ],
+        "repeat_interval_sec": 6.0606,
+        "aed_type": "CR2"
+    }
+]

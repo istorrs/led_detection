@@ -1,0 +1,34 @@
+[
+  {
+    "name": "CR2 Ambient Office Dim - transient",
+    "directory": "TestData/CR2/3039_run1_ambient_office_dim",
+    "expected_count": 1,
+    "expected_frames": [121],
+    "repeat_interval_sec": 2.0,
+    "aed_type": "CR2"
+  },
+  {
+    "name": "CR2 Office Phone Flash - transient",
+    "directory": "TestData/CR2/3251_run1_phoneflash",
+    "expected_count": 2,
+    "expected_frames": [40, 222],
+    "repeat_interval_sec": 2.0,
+    "aed_type": "CR2"
+  },
+  {
+    "name": "CR2 Desk Lamp Bright 15gt Miss 188 - transient",
+    "directory": "TestData/CR2/4765_run1_desklamp_bright_15gt_miss_188",
+    "expected_count": 2,
+    "expected_frames": [6, 188],
+    "repeat_interval_sec": 2.0,
+    "aed_type": "CR2"
+  },
+    {
+    "name": "CR2 Office Phone Flash Bright - transient",
+    "directory": "TestData/CR2/3598_run1_phoneflash_bright",
+    "expected_count": 2,
+    "expected_frames": [79, 261],
+    "repeat_interval_sec": 2.0,
+    "aed_type": "CR2"
+  }
+]

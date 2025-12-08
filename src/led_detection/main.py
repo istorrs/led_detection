@@ -6,9 +6,17 @@ import logging
 import argparse
 import os
 import shutil
+import json
+import re
 from datetime import datetime
+from collections import Counter
 import numpy as np
 import cv2
+
+def natural_sort_key(s):
+    """Natural sort key for filenames with numbers."""
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
 
 # --- SYSTEM SETUP ---
 SYS_OS = platform.system()
@@ -74,14 +82,24 @@ class RPiCameraDriver(CameraDriver):
 class X86CameraDriver(CameraDriver):
     """Driver for X86/USB Camera."""
     def __init__(self, idx=0, w=640, h=480):
-        bk = cv2.CAP_DSHOW if SYS_OS == "Windows" else cv2.CAP_V4L2
-        self.cap = cv2.VideoCapture(idx, bk)
+        self.idx = idx
+        self.w = w
+        self.h = h
+        self.backend = cv2.CAP_DSHOW if SYS_OS == "Windows" else cv2.CAP_V4L2
+        self.cap = None
+        self._open_camera()
+
+    def _open_camera(self):
+        if self.cap is not None and self.cap.isOpened():
+            return
+
+        self.cap = cv2.VideoCapture(self.idx, self.backend)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self.h, self.w = h, w
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
 
     def start(self):
+        self._open_camera()
         if SYS_OS == "Linux":
             for _ in range(3):
                 self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -150,9 +168,13 @@ class X86CameraDriver(CameraDriver):
         logging.info("--------------------------")
 
     def stop(self):
-        self.cap.release()
+        if self.cap:
+            self.cap.release()
+            self.cap = None
 
     def get_frame(self):
+        if self.cap is None or not self.cap.isOpened():
+            return np.zeros((self.h, self.w), dtype=np.uint8)
         r, f = self.cap.read()
         if r:
             return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
@@ -1432,28 +1454,31 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
                      len(frames), duration, len(frames)/duration)
         return frames
 
-    def _find_roi_from_variance(self, frames):
-        """Helper to find ROI based on variance map."""
-        # pylint: disable=too-many-locals
-        # Convert to grayscale first if needed
+    def _compute_variance_map(self, frames):
+        """Helper to compute variance map from frames."""
         gray_frames = []
         for _, f in frames:
             if len(f.shape) == 3 and f.shape[2] == 3:
                 gray_frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
             else:
-                gray_frames.append(f) # Already grayscale or single channel
+                gray_frames.append(f)
 
         stack = np.stack(gray_frames, axis=0)
-
-        # Calculate variance map
         variance_map = np.var(stack, axis=0)
+        return variance_map, stack.shape
 
-        # Find the area with max variance
+    def _find_roi_from_map(self, variance_map, mask=None, _shape=None):
+        """Helper to find ROI from variance map with optional mask."""
+        # pylint: disable=too-many-locals
         # Blur slightly to reduce noise
-        variance_map = cv2.GaussianBlur(variance_map, (5, 5), 0)
+        v_map = cv2.GaussianBlur(variance_map, (5, 5), 0)
+
+        # Apply mask if provided
+        if mask is not None:
+            v_map = cv2.bitwise_and(v_map, v_map, mask=mask)
 
         # Find max location
-        _, max_val, _, max_loc = cv2.minMaxLoc(variance_map)
+        _, max_val, _, max_loc = cv2.minMaxLoc(v_map)
         logging.info("Max variance: %.1f at %s", max_val, max_loc)
 
         if max_val < 10.0: # Threshold for "no activity"
@@ -1463,40 +1488,45 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
         # Define ROI around max location (e.g., 20x20)
         x, y = max_loc
         w, h = 20, 20
+        # shape is (N, H, W) or (H, W)
+        img_h, img_w = variance_map.shape
+
         x1 = max(0, x - w//2)
         y1 = max(0, y - h//2)
-        x2 = min(stack.shape[2], x + w//2)
-        y2 = min(stack.shape[1], y + h//2)
+        x2 = min(img_w, x + w//2)
+        y2 = min(img_h, y + h//2)
 
         roi = (y1, y2, x1, x2)
         logging.info("ROI found: %s", roi)
         return roi
+
+    def _find_roi_from_variance(self, frames):
+        """Legacy helper to find ROI based on variance map."""
+        v_map, _ = self._compute_variance_map(frames)
+        return self._find_roi_from_map(v_map)
 
     def analyze_frame_buffer(self, frames):
         """
         Analyzes the frame buffer to find the LED ROI and extract the signal.
         Returns (roi, signal_values, timestamps).
         """
-        # pylint: disable=too-many-locals
+        # pylint: disable=too-many-locals, R0914
         if not frames:
             return None, [], []
 
         logging.info("Analyzing %d frames...", len(frames))
 
-        # 1. Compute Frame Differences to find ROI (if not already found)
-        # Check self.roi explicitly in case it was set externally (e.g., by pre-scan)
-        if self.roi is None:
-            self.roi = self._find_roi_from_variance(frames)
-            if self.roi is None:
-                return None, [], []
+        # 1. Compute Variance Map (Once)
+        variance_map, _ = self._compute_variance_map(frames)
+        stack_h, stack_w = variance_map.shape
+        mask = np.full((stack_h, stack_w), 255, dtype=np.uint8) # Start with full mask
 
-        y1, y2, x1, x2 = self.roi
+        best_result = None # (roi, signal, timestamps)
 
-        # 2. Extract Signal from ROI
-        signal_values = []
-        timestamps = [ts for ts, _ in frames]
+        # Max attempts to find a valid signal (masking out artifacts)
+        MAX_ATTEMPTS = 5
 
-        # Need to ensure frames are grayscale for signal extraction
+        # Prepare frames for extraction
         gray_frames = []
         for _, f in frames:
             if len(f.shape) == 3 and f.shape[2] == 3:
@@ -1504,74 +1534,145 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             else:
                 gray_frames.append(f)
 
-        for i in range(len(frames)):
-            # Average brightness in ROI
-            roi_frame = gray_frames[i][y1:y2, x1:x2]
-            avg_val = np.mean(roi_frame)
-            signal_values.append(avg_val)
+        timestamps = [ts for ts, _ in frames]
 
-        return self.roi, signal_values, timestamps
+        for attempt in range(MAX_ATTEMPTS):
+            logging.info("ROI Search Attempt %d/%d", attempt + 1, MAX_ATTEMPTS)
+
+            # Find ROI using current mask
+            roi = self._find_roi_from_map(variance_map, mask=mask)
+            if roi is None:
+                logging.warning("No ROI found on attempt %d.", attempt + 1)
+                break
+
+            y1, y2, x1, x2 = roi
+
+            # Extract Signal
+            signal_values = []
+            for i in range(len(frames)):
+                roi_frame = gray_frames[i][y1:y2, x1:x2]
+                val = self._measure_roi(roi_frame)
+                signal_values.append(val)
+
+            # Quick Check for Pulses
+            # We need a temporary threshold to validate if this ROI is good
+            if not signal_values:
+                break
+
+            sig_min = np.min(signal_values)
+            sig_max = np.max(signal_values)
+            sig_range = sig_max - sig_min
+            curr_threshold = sig_min + (sig_range * 0.5)
+
+            # Estimate interval (default 30fps if unknown)
+            if len(timestamps) > 1:
+                avg_interval = (timestamps[-1] - timestamps[0]) / (len(timestamps) - 1)
+            else:
+                avg_interval = 0.0333
+
+            pulses = self._detect_pulses(signal_values, timestamps, curr_threshold, avg_interval)
+
+            result = (roi, signal_values, timestamps)
+
+            if len(pulses) > 0:
+                logging.info("Attempt %d successful: Detected %d pulses.", attempt + 1, len(pulses))
+                self.roi = roi
+                return result
+
+            # If 0 pulses, this might be an artifact. Mask it and retry.
+            logging.info("Attempt %d rejected: 0 pulses. Masking ROI %s and retrying.", attempt + 1, roi)
+
+            # Mask out the ROI in the variance map mask
+            # ROI is (y1, y2, x1, x2). Mask is (H, W).
+            # Dilate mask slightly to avoid overlapping edges
+            pad = 50
+            mx1, mx2 = max(0, x1 - pad), min(stack_w, x2 + pad)
+            my1, my2 = max(0, y1 - pad), min(stack_h, y2 + pad)
+            cv2.rectangle(mask, (mx1, my1), (mx2, my2), 0, -1)
+
+            # Keep the first result as fallback if all fail
+            if best_result is None:
+                best_result = result
+
+        # If we exhausted attempts, return best (first) result or None
+        if best_result:
+            self.roi = best_result[0]
+            logging.warning("All attempts failed to find pulses. Returning best candidate.")
+            return best_result
+
+        return None, [], []
 
     def _detect_pulses(self, signal_values, timestamps, threshold, avg_frame_interval):
         """Helper to detect pulses from binary signal."""
         # pylint: disable=too-many-locals
-        binary_signal = [1 if v > threshold else 0 for v in signal_values]
         pulses = []
+        if not signal_values:
+            return pulses
+
+        binary_signal = [1 if val > threshold else 0 for val in signal_values]
+
+        # Use 0 -> 1 transition to detect rising edge
+        # and 1 -> 0 transition to detect falling edge
         current_state = 0
-        start_time = 0
+        start_time = 0.0
         start_index = 0
 
-        # We need to access previous values for interpolation
-        for i, val in enumerate(binary_signal):
-            if i == 0:
-                current_state = val
-                if val == 1:
-                    start_time = timestamps[0]
-                    start_index = 0
-                continue
+        # Enforce initial state
+        # If signal starts HIGH, we consider it ON but need careful handling
+        if binary_signal[0] == 1:
+            current_state = 1
+            start_time = timestamps[0]
+            start_index = 0
 
-            state = val # This is binary_signal[i]
-            t2 = timestamps[i]
-            t1 = timestamps[i-1]
-            v2 = signal_values[i]
-            v1 = signal_values[i-1]
-
-            # Rising Edge: 0 -> 1
-            if current_state == 0 and state == 1:
-                # Interpolate exact crossing time
-                # v1 <= threshold < v2
-                denom = v2 - v1
-                fraction = (threshold - v1) / denom if denom != 0 else 0.5
-                start_time = t1 + (t2 - t1) * fraction
-                start_index = i
+        for i in range(1, len(binary_signal)):
+            if binary_signal[i] == 1 and current_state == 0:
+                # Rising edge
                 current_state = 1
-
-            # Falling Edge: 1 -> 0
-            elif current_state == 1 and state == 0:
-                # Interpolate exact crossing time
-                # v1 > threshold >= v2
-                denom = v2 - v1
-                fraction = (threshold - v1) / denom if denom != 0 else 0.5
-                end_time = t1 + (t2 - t1) * fraction
-
-                duration = (end_time - start_time) * 1000.0 # ms
-
-                # Calculate frame-based duration
-                # Number of frames where signal was 1 (approximate)
-                # This is just end_index - start_index?
-                # binary_signal[start_index] is 1. binary_signal[i] is 0.
-                # So frames are start_index to i-1.
+                start_time = timestamps[i-1]
+                start_index = i - 1
+            elif binary_signal[i] == 0 and current_state == 1:
+                # Falling edge
+                end_time = timestamps[i]
+                duration = end_time - start_time
                 num_frames = i - start_index
                 duration_frames = num_frames * avg_frame_interval * 1000.0
 
+                if start_index == 0 and binary_signal[0] == 1:
+                    # Heuristic: Reject pulses that start immediately (Sequence starts ON)
+                    # This filters "Step Down" artifacts (e.g. phone flash washout)
+                    # where high contrast at start transitions to low contrast.
+                    # Real LEDs in this context (blinking) should have a rising edge.
+                    logging.debug("Ignored pulse starting at index 0 (Step Down artifact)")
+                else:
+                    pulses.append({
+                        'start': start_time,
+                        'end': end_time,
+                        'duration': duration,
+                        'num_frames': num_frames,
+                        'duration_frames': duration_frames,
+                        'start_index': start_index
+                    })
+                current_state = 0
+
+        # Handle open-ended pulse (ends at last frame)
+        if current_state == 1:
+            end_time = timestamps[-1]
+            duration = (end_time - start_time) * 1000.0
+            num_frames = len(binary_signal) - start_index
+            duration_frames = num_frames * avg_frame_interval * 1000.0
+
+            if start_index == 0:
+                logging.debug("Ignored open-ended pulse starting at index 0")
+            else:
                 pulses.append({
                     'start': start_time,
                     'end': end_time,
                     'duration': duration,
                     'num_frames': num_frames,
-                    'duration_frames': duration_frames
+                    'duration_frames': duration_frames,
+                    'start_index': start_index
                 })
-                current_state = 0
+
         return pulses
 
     def verify_signal(self, signal_values, timestamps, expected_period, expected_duration, tolerance=0.2, frames=None):
@@ -1786,72 +1887,247 @@ class PeakMonitor:  # pylint: disable=too-many-instance-attributes
             logging.error("Folder not found: %s", folder_path)
             return False
 
-        # 1. Read images
-        frames = []
-        files = sorted([f for f in os.listdir(folder_path) if f.endswith(".jpg")])
-
-        if not files:
-            logging.error("No .jpg images found in %s", folder_path)
-            return False
-
-        logging.info("Found %d images", len(files))
-
-        for f in files:
-            # Parse timestamp from filename
-            # Format: frame_INDEX_TIMESTAMP.jpg or frame_INDEX_TIMESTAMP_val_XXX.jpg
-            # We need the timestamp part.
-            # Example: frame_0_1.234.jpg -> 1.234
-            try:
-                parts = f.split('_')
-                # parts[0] = frame
-                # parts[1] = index
-                # parts[2] = timestamp (maybe with .jpg or _val...)
-
-                ts_part = parts[2]
-                if ts_part.endswith(".jpg"):
-                    ts_str = ts_part[:-4]
-                else:
-                    # Handle _val_XXX case
-                    # If parts has more elements, timestamp is likely just parts[2]
-                    # But we need to be careful if timestamp contains underscores (unlikely based on my code)
-                    # My code uses f"frame_{j}_{t:.3f}" -> 1.234
-                    # So it should be safe to take parts[2] and strip .jpg or stop at next _
-                    ts_str = ts_part
-                    if ".jpg" in ts_str:
-                        ts_str = ts_str.replace(".jpg", "")
-
-                t = float(ts_str)
-
-                img_path = os.path.join(folder_path, f)
-                img = cv2.imread(img_path)
-                if img is not None:
-                    frames.append((t, img))
-                else:
-                    logging.warning("Failed to read image: %s", f)
-
-            except Exception as e: # pylint: disable=broad-exception-caught
-                logging.warning("Skipping file %s: %s", f, e)
-                continue
-
+        frames = self._load_frames_from_folder(folder_path)
         if not frames:
-            logging.error("No valid frames loaded.")
             return False
-
-        # Sort by timestamp just in case
-        frames.sort(key=lambda x: x[0])
 
         logging.info("Loaded %d frames. Duration: %.1fs", len(frames), frames[-1][0] - frames[0][0])
 
-        # 2. Analyze Frames
-        # We need to set self.roi if not set?
-        # analyze_frame_buffer calls find_roi_from_variance if self.roi is None.
-        # This should work fine.
-        _, signal_values, timestamps = self.analyze_frame_buffer(frames)
+        # 2. Analyze
+        # Use existing analyze_frame_buffer
+        self.roi, signal_values, timestamps = self.analyze_frame_buffer(frames)
 
-        # 3. Verify Signal
+        # 5. Verify Signal
         success = self.verify_signal(signal_values, timestamps, expected_period, expected_duration, tolerance, frames)
 
-        return success
+        if self.preview:
+            cv2.destroyAllWindows()
+
+        if success:
+            print("\n[SUCCESS] Signal Verified!")
+            return True
+        print("\n[FAILURE] Signal Verification Failed.")
+        return False
+
+    def _load_frames_from_folder(self, folder_path):
+        """Load frames from a folder with robust timestamp parsing."""
+        # pylint: disable=too-many-locals
+        frames = []
+        # Sort naturally if possible, mimicking simple alphanumeric sort for now
+        files = sorted([f for f in os.listdir(folder_path) if f.casefold().endswith((".jpg", ".jpeg"))])
+
+        if not files:
+            logging.error("No .jpg images found in %s", folder_path)
+            return []
+
+        # Sort files naturally (fixes frame-10 before frame-2 issue)
+        files.sort(key=natural_sort_key)
+
+        logging.info("Found %d images in %s", len(files), folder_path)
+
+        loaded_candidates = []
+
+        for i, f in enumerate(files):
+            # 1. Filter out templates
+            if "template" in f.casefold():
+                logging.debug("Skipping template file: %s", f)
+                continue
+
+            # Parse timestamp/index
+            t = 0.0
+            parsed = False
+
+            # Check for specific timestamp format (frame_INDEX_TIMESTAMP.jpg)
+            try:
+                parts = f.split('_')
+                if len(parts) >= 3:
+                    # Attempt to parse float timestamp
+                    ts_part = parts[2].replace(".jpg", "").replace(".jpeg", "")
+                    t = float(ts_part)
+                    parsed = True
+            except (ValueError, IndexError):
+                pass
+
+            if not parsed:
+                # Fallback: Extract integer index from filename (e.g., LED-frame-123.jpg)
+                # Matches "frame" followed by numbers, with optional separator
+                match = re.search(r'frame[-_]?(\d+)', f, re.IGNORECASE)
+                if match:
+                    idx = int(match.group(1))
+                    t = idx * 0.0333  # Assume 30 FPS
+                else:
+                    # Fallback to loop index if no number found
+                    t = i * 0.0333
+
+            img_path = os.path.join(folder_path, f)
+            img = cv2.imread(img_path)
+            if img is not None:
+                loaded_candidates.append({'t': t, 'img': img, 'shape': img.shape, 'file': f})
+            else:
+                logging.warning("Failed to read image: %s", f)
+
+        if not loaded_candidates:
+            return []
+
+        # 2. Find dominant resolution
+        shapes = [c['shape'] for c in loaded_candidates]
+        shape_counts = Counter(shapes)
+        most_common_shape = shape_counts.most_common(1)[0][0]
+
+        if len(shape_counts) > 1:
+            logging.info("Found multiple resolutions: %s. Selecting dominant: %s", shape_counts, most_common_shape)
+
+        # 3. Filter frames
+        frames = []
+        for c in loaded_candidates:
+            if c['shape'] == most_common_shape:
+                frames.append((c['t'], c['img']))
+            else:
+                logging.warning("Skipping mismatch frame %s: %s vs %s", c['file'], c['shape'], most_common_shape)
+
+        # Sort frames by timestamp
+        frames.sort(key=lambda x: x[0])
+
+        return frames
+
+    def run_batch_classification(self, root_folder, output_json, save_videos=False):
+        """
+        Recursive batch classification of image sequences.
+        Generates a JSON report.
+        """
+        # pylint: disable=too-many-locals
+        logging.info("Starting Batch Classification on: %s", root_folder)
+        results = []
+
+        # walk
+        for root, _, files in os.walk(root_folder):
+            # Check if this folder has images
+            jpgs = [f for f in files if f.casefold().endswith((".jpg", ".jpeg"))]
+            if not jpgs:
+                continue
+
+            logging.info("Processing sequence: %s", root)
+
+            # Analyze this folder
+            # 1. Load frames
+            frames = self._load_frames_from_folder(root)
+            if not frames:
+                continue
+
+            # Optional: Generate Video
+            if save_videos and frames:
+                try:
+                    folder_name = os.path.basename(root)
+                    video_filename = f"classification_preview_{folder_name}.mp4"
+                    video_path = os.path.join(root, video_filename)
+                    height, width, _ = frames[0][1].shape
+
+                    # mp4v is widely supported on OpenCV/Linux
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(video_path, fourcc, 30.0, (width, height))
+
+                    if out.isOpened():
+                        for idx, (_, frame) in enumerate(frames):
+                            # Overlay frame number
+                            # Copy frame to avoid modifying original? original used for calc?
+                            # variance_map uses original frames. If we modify 'frames' list objects,
+                            # it might affect subsequent processing if order matters.
+                            # But video gen is BEFORE analysis?
+                            # Wait, video gen is at the START of run_batch_classification loop?
+                            # Let's check where this block is relative to analysis.
+                            # It is right after loading frames.
+                            # Analysis happens LATER (line 2053).
+                            # 'frames' holds valid image data. Using cv2.putText modifies in-place.
+                            # We should make a copy for the video to verify analysis is clean.
+
+                            video_frame = frame.copy()
+                            text = f"Frame: {idx}"
+                            cv2.putText(video_frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                        1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                            out.write(video_frame)
+                        out.release()
+                        logging.debug("Saved video preview: %s", video_path)
+                    else:
+                        logging.warning("Failed to open VideoWriter for %s", video_path)
+                except Exception as e: # pylint: disable=broad-exception-caught
+                    logging.warning("Failed to create video: %s", e)
+
+            # 2. Blind Analysis (No expected period/duration)
+            # Find ROI
+            self.roi = None # Reset ROI for new folder!
+            self.roi, signal_values, timestamps = self.analyze_frame_buffer(frames)
+
+            if not signal_values:
+                logging.warning("No signal extracted from %s", root)
+                continue
+
+            # 3. Detect Pulses (Blind)
+            # Calculate threshold similar to verify_signal
+            sig_min = np.min(signal_values)
+            sig_max = np.max(signal_values)
+            sig_range = sig_max - sig_min
+            # Use 50% threshold for now, maybe adaptive later?
+            threshold = sig_min + (sig_range * 0.5)
+
+            logging.debug("Signal Stats: Min=%.2f, Max=%.2f, Range=%.2f, Thr=%.2f",
+                          sig_min, sig_max, sig_range, threshold)
+
+            # Calculate avg interval
+            avg_interval = 0.033
+            if len(timestamps) > 1:
+                avg_interval = (timestamps[-1] - timestamps[0]) / (len(timestamps) - 1)
+
+            detected_pulses = self._detect_pulses(signal_values, timestamps, threshold, avg_interval)
+            logging.info("  Detected %d pulses", len(detected_pulses))
+            for i, p in enumerate(detected_pulses):
+                logging.info("    Pulse %d: Start=%.3f (Idx %d), Dur=%.1fms", i, p['start'], p['start_index'], p['duration'])
+
+            # 4. Determine AED Type
+            aed_type = "Unknown"
+            if "CR2" in root:
+                aed_type = "CR2"
+            elif "Philips" in root:
+                aed_type = "Philips"
+
+            # 5. Determine Repeat Interval (Pulse Period)
+            pulse_repeat_interval = 0.0
+            if len(detected_pulses) > 1:
+                # Average period between pulses
+                periods = []
+                for j in range(1, len(detected_pulses)):
+                    diff = detected_pulses[j]['start'] - detected_pulses[j-1]['start']
+                    periods.append(diff)
+                pulse_repeat_interval = float(np.mean(periods))
+
+            if len(detected_pulses) > 0:
+                # Heuristic: Check interval (Overwrites if detection is strong)
+                if len(detected_pulses) > 1:
+                    if 1.8 < pulse_repeat_interval < 2.2:
+                        aed_type = "CR2"
+                    elif 3.8 < pulse_repeat_interval < 4.2:
+                        aed_type = "Philips"
+
+            result_entry = {
+                "name": os.path.basename(root),
+                "directory": root,
+                "expected_count": len(detected_pulses),
+                "expected_frames": [p['start_index'] for p in detected_pulses],
+                "repeat_interval_sec": pulse_repeat_interval,
+                "aed_type": aed_type
+            }
+            results.append(result_entry)
+
+        # Save JSON
+        try:
+            with open(output_json, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=4)
+            logging.info("Saved classification results to %s", output_json)
+        except IOError as e:
+            logging.error("Failed to save JSON: %s", e)
+            logging.error("No valid frames loaded.")
+            return False
+
+        return True
 
     def run(self):
         """Run the monitor loop."""
@@ -1951,6 +2227,10 @@ To disable a feature, use --no-<feature>, e.g., --no-autofocus
     parser.add_argument("--offline", dest="offline_folder", type=str,
                        help="Run detection on a folder of images (offline mode)")
 
+    parser.add_argument("--classify-folder", type=str, help="Root folder for batch classification")
+    parser.add_argument("--output-json", type=str, help="Output JSON file for classification results")
+    parser.add_argument("--save-videos", action="store_true", help="Generate video previews for classified sequences")
+
     args = parser.parse_args()
 
     setup_logging(args.debug)
@@ -1978,6 +2258,15 @@ To disable a feature, use --no-<feature>, e.g., --no-autofocus
             autofocus=args.autofocus,
             min_pulse_duration=args.min_pulse_duration
         )
+
+        if args.classify_folder:
+            # Batch Classification Mode
+            if not args.output_json:
+                logging.error("Batch classification requires --output-json")
+                sys.exit(1)
+
+            success = monitor.run_batch_classification(args.classify_folder, args.output_json, save_videos=args.save_videos)
+            sys.exit(0 if success else 1)
 
         if args.offline_folder:
             # Offline Mode
