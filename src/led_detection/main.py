@@ -44,7 +44,7 @@ class CameraDriver:
     def stop(self):
         """Stop the camera."""
 
-    def get_frame(self):
+    def get_frame(self, color=False):
         """Get a frame from the camera."""
         raise NotImplementedError
 
@@ -76,7 +76,12 @@ class RPiCameraDriver(CameraDriver):
     def stop(self):
         self.p.stop()
 
-    def get_frame(self):
+    def get_frame(self, color=False):
+        # RPi driver currently only configured for YUV420/Gray mainly, need to check if color fits current config
+        # For now, ignore color arg or return Y channel if that's what we have
+        # .capture_array("main") returns YUV, so we can extract Y.
+        # If color needed, we might need to change 'format' in configure or convert.
+        # Keeping existing behavior for safety unless forced.
         return self.p.capture_array("main")[:self.h, :self.w]
 
 class X86CameraDriver(CameraDriver):
@@ -172,13 +177,15 @@ class X86CameraDriver(CameraDriver):
             self.cap.release()
             self.cap = None
 
-    def get_frame(self):
+    def get_frame(self, color=False):
         if self.cap is None or not self.cap.isOpened():
-            return np.zeros((self.h, self.w), dtype=np.uint8)
+            return np.zeros((self.h, self.w, 3 if color else 1), dtype=np.uint8)
         r, f = self.cap.read()
         if r:
+            if color:
+                return f
             return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        return np.zeros((self.h, self.w), dtype=np.uint8)
+        return np.zeros((self.h, self.w, 3 if color else 1), dtype=np.uint8)
 
 def get_driver():
     """Factory method to get the appropriate camera driver."""

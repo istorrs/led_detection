@@ -152,8 +152,8 @@ class LEDController:
             True if command succeeded, False otherwise
         """
         # Validate parameters
-        if not 50 <= duration_ms <= 2000:
-            logging.error("Duration %dms out of range (50-2000)", duration_ms)
+        if not 0.5 <= duration_ms <= 2000:
+            logging.error("Duration %.1fms out of range (0.5-2000)", duration_ms)
             return False
 
         if not 500 <= period_ms <= 3600000:
@@ -165,7 +165,15 @@ class LEDController:
             return False
 
         # Add units to command
-        command = f"led_pulse {duration_ms}ms {period_ms}ms {brightness_pct}"
+        # Use microseconds for sub-ms durations to avoid floats (which firmware rejects)
+        if duration_ms < 1.0:
+            duration_us = int(duration_ms * 1000)
+            dur_str = f"{duration_us}us"
+        else:
+            # Use ms, but clean up ".0" if it's an integer
+            dur_str = f"{int(duration_ms)}ms" if duration_ms.is_integer() else f"{duration_ms}ms"
+
+        command = f"led_pulse {dur_str} {period_ms}ms {brightness_pct}"
         logging.info("Sending: %s", command)
         response = self.send_command(command)
 
@@ -214,8 +222,8 @@ class LEDController:
 
     def stop_pulse(self):
         """Stop LED pulsing."""
-        # Use minimum valid duration (50ms) with 0% brightness to effectively stop
-        command = "led_pulse 50 1000 0"
+        # Use valid duration (1ms) with 0% brightness to effectively stop
+        command = "led_pulse 1ms 1000ms 0"
         return self.send_command(command) is not None
 
     def __enter__(self):
