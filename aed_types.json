@@ -1,0 +1,122 @@
+{
+    "_comment": "Field definitions for AED parameters used in LED detection algorithm",
+    "field_definitions": {
+        "id": "Integer identifier passed as command line argument to analysis tool",
+        "name": "Human readable model name of the AED",
+        "params": {
+            "pixel_threshold": "Minimum pixel intensity change required to consider a pixel 'changed'. Range 0-255.",
+            "pixel_threshold_max": "Maximum pixel intensity change allowed. Usually 2147483647 (disabled).",
+            "binary_threshold": "Threshold for binary mask generation. Pixels above this are counted.",
+            "blink_period_seconds": "Expected time in seconds between LED pulses. -1 indicates unknown/aperiodic.",
+            "blink_period_margin_percent": "Allowed deviation (%) from the blink_period_seconds for a valid repetition.",
+            "blink_frames_max": "Maximum duration (in frames @ 30fps) a single pulse can last.",
+            "blink_frames_min": "Minimum duration (in frames @ 30fps) a single pulse must last."
+        }
+    },
+    "aed_types": [
+        {
+            "id": 0,
+            "name": "lcd",
+            "params": {
+                "pixel_threshold": 128,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": -1,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 6,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 1,
+            "name": "heartstart_frx",
+            "params": {
+                "pixel_threshold": 32,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 10,
+                "blink_period_seconds": 3.03,
+                "blink_period_margin_percent": 80,
+                "blink_frames_max": 3,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 2,
+            "name": "heartstart_onsite",
+            "params": {
+                "pixel_threshold": 32,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": 3.03,
+                "blink_period_margin_percent": 80,
+                "blink_frames_max": 3,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 3,
+            "name": "lifepak_cr2",
+            "params": {
+                "pixel_threshold": 128,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": 6.06,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 5,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 4,
+            "name": "samaritan",
+            "params": {
+                "pixel_threshold": 128,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": 4.66,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 8,
+                "blink_frames_min": 3
+            }
+        },
+        {
+            "id": 5,
+            "name": "lifeline_view",
+            "params": {
+                "pixel_threshold": 16,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 10,
+                "blink_period_seconds": 5.03,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 6,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 6,
+            "name": "lifeline_auto",
+            "params": {
+                "pixel_threshold": 32,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": 5.03,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 6,
+                "blink_frames_min": 1
+            }
+        },
+        {
+            "id": 7,
+            "name": "lifepak_cr2_pelican_case",
+            "params": {
+                "pixel_threshold": 128,
+                "pixel_threshold_max": 2147483647,
+                "binary_threshold": 20,
+                "blink_period_seconds": 6.07,
+                "blink_period_margin_percent": 20,
+                "blink_frames_max": 5,
+                "blink_frames_min": 1
+            }
+        }
+    ]
+}

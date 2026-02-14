@@ -165,15 +165,11 @@ class LEDController:
             return False
 
         # Add units to command
-        # Use microseconds for sub-ms durations to avoid floats (which firmware rejects)
-        if duration_ms < 1.0:
-            duration_us = int(duration_ms * 1000)
-            dur_str = f"{duration_us}us"
-        else:
-            # Use ms, but clean up ".0" if it's an integer
-            dur_str = f"{int(duration_ms)}ms" if duration_ms.is_integer() else f"{duration_ms}ms"
+        # Use microseconds to avoid floats (which firmware rejects)
+        duration_us = int(duration_ms * 1000)
+        period_us = int(period_ms * 1000)
 
-        command = f"led_pulse {dur_str} {period_ms}ms {brightness_pct}"
+        command = f"led_pulse {duration_us}us {period_us}us {brightness_pct}"
         logging.info("Sending: %s", command)
         response = self.send_command(command)
 
@@ -200,10 +196,11 @@ class LEDController:
                 actual_dur_ms = self._parse_time_str(actual_dur_str)
                 actual_period_ms = self._parse_time_str(actual_period_str)
 
-                # Use a small tolerance for float conversions (e.g. 1ms)
-                if (abs(actual_dur_ms - duration_ms) > 1 or
+                # Use a larger tolerance for float conversions and firmware rounding
+                # Period can be rounded to 0.1s (100ms) by firmware for large values
+                if (abs(actual_dur_ms - duration_ms) > 2 or
                     actual_bright != brightness_pct or
-                    abs(actual_period_ms - period_ms) > 1):
+                    abs(actual_period_ms - period_ms) > 110):
                     logging.warning(
                         "LED response mismatch! Sent: %dms/%dms/%d%%, Got: %s/%s/%d%% (Parsed: %.1fms/%.1fms)",
                         duration_ms, period_ms, brightness_pct,
