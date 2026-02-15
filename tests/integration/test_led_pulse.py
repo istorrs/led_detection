@@ -18,7 +18,7 @@ TEST_CASES = []
 # Very short pulses (50-100ms): Test full brightness range 5-100 in steps of 5
 VERY_SHORT_DURATIONS = [50, 100]
 VERY_SHORT_PERIODS = [500, 1000]
-FULL_BRIGHTNESS = list(range(5, 101, 5))  # 5, 10, 15, ..., 100 (20 levels)
+FULL_BRIGHTNESS = [1] + list(range(5, 101, 5))  # 1, 5, 10, 15, ..., 100 (21 levels)
 
 for duration in VERY_SHORT_DURATIONS:
     for period in VERY_SHORT_PERIODS:

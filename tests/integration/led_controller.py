@@ -90,8 +90,7 @@ class LEDController:
                     time.sleep(0.05)  # Small delay to avoid busy-waiting
 
             if not response_lines:
-                logging.warning("No response received from LED controller")
-                return None
+                raise RuntimeError("No response received from LED controller")
 
             # Check for error responses from ESP32
             for line in response_lines:
@@ -219,9 +218,7 @@ class LEDController:
 
     def stop_pulse(self):
         """Stop LED pulsing."""
-        # Use valid duration (1ms) with 0% brightness to effectively stop
-        command = "led_pulse 1ms 1000ms 0"
-        return self.send_command(command) is not None
+        return self.send_command("led_off") is not None
 
     def __enter__(self):
         """Context manager entry."""
